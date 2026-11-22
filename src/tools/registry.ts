@@ -13,7 +13,8 @@ import { CLSID_MsRdpClientNotSafeForScripting, DLL_PATH_DEFAULT, IID_IMsRdpExIns
 import { findAllWindows, findWindow, hotkey, keyPress, mouseClick, typeText, VK } from '../transports/wininput.js';
 import { captureWindowPng } from '../transports/winsnapshot.js';
 import { EventMonitor, describeEventSinkPolicy, type SystemEvent } from '../transports/monitor.js';
-import { adminRoot, adbAvailable, adbExec, inputSwipe, inputTap, inputText, listDevices, screencapPng } from '../transports/adb.js';
+import { adminRoot, adbAvailable, adbExec, currentApp, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
+import type { AppsScope, SettingsNs, UiNode, UiPreset, UiTarget } from '../transports/adb.js';
 import { join, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -925,6 +926,272 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     async ({ serial, timeoutMs }) => {
       const r = await adminRoot(serial, timeoutMs);
       return toolText(`adb root ${serial}: ${r.ok ? 'ok' : 'refused'} -- ${r.output.slice(0, 300)}`, { serial, ok: r.ok, output: r.output });
+    },
+  );
+
+  // ------------------------------------------- adb UI control & device ops --
+  // These mirror the browser-mcp affordance model (snapshot / find / click by
+  // target / press / goto) so the same workflow applies to a real device, and
+  // every screen action targets parsed uiautomator nodes instead of guessed
+  // pixel coordinates.
+  const serialArg = z.string().min(1).describe('adb device serial (from adb_status)');
+  const tm15 = z.number().int().min(100).max(120000).default(15000);
+  const summarize = (n: UiNode) => ({
+    text: n.text || undefined,
+    desc: n.desc || undefined,
+    id: n.resourceId || undefined,
+    class: n.className,
+    clickable: n.clickable,
+    enabled: n.enabled,
+    center: [n.centerX, n.centerY],
+    bounds: n.bounds,
+  });
+  const targetFrom = (a: { text?: string; desc?: string; id?: string; className?: string; contains?: boolean }): UiTarget => ({
+    text: a.text,
+    desc: a.desc,
+    id: a.id,
+    className: a.className,
+    contains: a.contains,
+  });
+  const hasSelector = (a: UiTarget): boolean =>
+    a.text !== undefined || a.desc !== undefined || a.id !== undefined || a.className !== undefined;
+
+  p.define(
+    'adb_ui_dump',
+    'Snapshot the Android UI to a structured element tree (uiautomator dump) — the device equivalent of a browser snapshot: text, content-desc, resource-id, class, clickable and centre/bounds for every node. The foundation for selector-based control.',
+    { serial: serialArg, limit: z.number().int().min(1).max(400).default(200), timeoutMs: z.number().int().min(1000).max(60000).default(20000) },
+    async ({ serial, limit, timeoutMs }) => {
+      const nodes = await dumpUi(serial, timeoutMs);
+      const shown = nodes.slice(0, limit);
+      return toolText(
+        `UI dump ${serial}: ${nodes.length} node(s)${nodes.length > shown.length ? ` (showing ${shown.length})` : ''}\n` +
+          shown.map((n) => `[${n.centerX},${n.centerY}] ${n.className.split('.').pop()}${n.text ? ` text="${n.text}"` : ''}${n.desc ? ` desc="${n.desc}"` : ''}${n.resourceId ? ` id=${n.resourceId}` : ''}${n.clickable ? ' CLICKABLE' : ''}`).join('\n'),
+        { serial, total: nodes.length, shown: shown.length, truncated: nodes.length > shown.length, nodes: shown.map(summarize) },
+      );
+    },
+  );
+
+  p.define(
+    'adb_ui_find',
+    'Find UI elements on the Android device by text, content-desc, resource-id, or class (substring or exact) — the device equivalent of browser find. Returns matching nodes with their centre coordinates.',
+    {
+      serial: serialArg,
+      text: z.string().min(1).optional(),
+      desc: z.string().min(1).optional(),
+      id: z.string().min(1).optional(),
+      className: z.string().min(1).optional(),
+      contains: z.boolean().default(true).describe('substring match (default); set false for exact equality'),
+      timeoutMs: z.number().int().min(1000).max(60000).default(20000),
+    },
+    async ({ serial, text, desc, id, className, contains, timeoutMs }) => {
+      const t = targetFrom({ text, desc, id, className, contains });
+      if (!hasSelector(t)) return toolError('BAD_ARGS', 'adb_ui_find needs at least one of text, desc, id, or className', {}, 'pass text, desc (content-description), id (resource-id), or className to search for');
+      const nodes = await dumpUi(serial, timeoutMs);
+      const found = findUiNodes(nodes, t);
+      return toolText(
+        found.length ? `${found.length} match(es) on ${serial}:\n` + found.map((n) => `[${n.centerX},${n.centerY}] ${n.className.split('.').pop()}${n.text ? ` text="${n.text}"` : ''}${n.desc ? ` desc="${n.desc}"` : ''} click=${n.clickable}`).join('\n') : `no elements match on ${serial}`,
+        { serial, count: found.length, matches: found.map(summarize) },
+      );
+    },
+  );
+
+  p.define(
+    'adb_ui_tap',
+    'Tap a UI element by selector (text/desc/id/className) — the device equivalent of browser click<target>. Dumps the hierarchy, resolves the element, and taps its centre; safer and self-correcting versus guessing pixel coordinates.',
+    {
+      serial: serialArg,
+      text: z.string().min(1).optional(),
+      desc: z.string().min(1).optional(),
+      id: z.string().min(1).optional(),
+      className: z.string().min(1).optional(),
+      contains: z.boolean().default(true),
+      index: z.number().int().min(0).optional().describe('which match to tap when several match (0-based); defaults to the first clickable'),
+      timeoutMs: z.number().int().min(1000).max(60000).default(20000),
+    },
+    async ({ serial, text, desc, id, className, contains, index, timeoutMs }) => {
+      const t = targetFrom({ text, desc, id, className, contains });
+      if (!hasSelector(t)) return toolError('BAD_ARGS', 'adb_ui_tap needs at least one of text, desc, id, or className', {}, 'identify the element with text/desc/id/className; run adb_ui_dump first to see the tree');
+      const nodes = await dumpUi(serial, timeoutMs);
+      const found = findUiNodes(nodes, t);
+      if (found.length === 0) {
+        const hints = nodes.filter((n) => n.clickable && (n.text || n.desc)).slice(0, 12).map((n) => (n.text || n.desc));
+        return toolError('BAD_ARGS', `no element matches the selector on ${serial}`, { selector: t }, `pick one of the on-screen controls: ${hints.join(' | ') || 'no labelled controls found — the screen may be animating or secure; retry after adb_screencap confirms the state'}`);
+      }
+      const clickableFirst = [...found].sort((a, b) => Number(b.clickable) - Number(a.clickable));
+      const chosen = index !== undefined ? found[index] : clickableFirst[0];
+      if (!chosen) return toolError('BAD_ARGS', `index ${index} is out of range: ${found.length} match(es)`, { index, count: found.length });
+      await inputTap(serial, chosen.centerX, chosen.centerY, timeoutMs);
+      return toolText(
+        `tapped ${chosen.className.split('.').pop()} at [${chosen.centerX},${chosen.centerY}] on ${serial}${chosen.text ? ` text="${chosen.text}"` : ''}${chosen.desc ? ` desc="${chosen.desc}"` : ''}${found.length > 1 ? ` (${found.length} matched, tapped ${index ?? 'first-clickable'})` : ''}`,
+        { serial, center: [chosen.centerX, chosen.centerY], matched: found.length, node: summarize(chosen) },
+      );
+    },
+  );
+
+  p.define(
+    'adb_ui_set_text',
+    'Focus a UI field by selector and type into it (browser "fill" equivalent). Honest limitation: input text APPENDS to the focused field and cannot reliably select-all across keyboards, so clear the field first (adb_key backspace / dpad) if a replace is required.',
+    {
+      serial: serialArg,
+      text: z.string().min(1).optional(),
+      desc: z.string().min(1).optional(),
+      id: z.string().min(1).optional(),
+      className: z.string().min(1).optional(),
+      contains: z.boolean().default(true),
+      value: z.string().min(1).describe('text to type into the focused field ([A-Za-z0-9 ._-] only)'),
+      timeoutMs: z.number().int().min(1000).max(60000).default(20000),
+    },
+    async ({ serial, text, desc, id, className, contains, value, timeoutMs }) => {
+      const t = targetFrom({ text, desc, id, className, contains });
+      if (!hasSelector(t)) return toolError('BAD_ARGS', 'adb_ui_set_text needs a selector for the field', {}, 'identify the input field with text/desc/id/className');
+      const nodes = await dumpUi(serial, timeoutMs);
+      const found = findUiNodes(nodes, t);
+      if (found.length === 0) return toolError('BAD_ARGS', `no field matches the selector on ${serial}`, { selector: t }, 'run adb_ui_dump to find the input node, then retry');
+      await setTextField(serial, found[0], value, timeoutMs);
+      return toolText(`typed ${value.length} chars into ${found[0].className.split('.').pop()} on ${serial} (appended)`, { serial, node: summarize(found[0]), typed: value.length });
+    },
+  );
+
+  p.define(
+    'adb_key',
+    'Send a named Android key event (browser "press" equivalent): home, back, recents, enter, search, menu, power, volume_up/down/mute, media_play/pause/next/previous/stop, dpad_*, delete, tab, escape, or a raw numeric code.',
+    { serial: serialArg, key: z.string().min(1), timeoutMs: tm15 },
+    async ({ serial, key, timeoutMs }) => {
+      const code = resolveKeyCode(key);
+      if (code === null) return toolError('BAD_ARGS', `unknown key "${key}"`, { key }, `known keys: ${knownKeyNames().join(', ')} — or pass a numeric key code`);
+      await inputKey(serial, code, timeoutMs);
+      return toolText(`sent key "${key}" (code ${code}) to ${serial}`, { serial, key, code });
+    },
+  );
+
+  p.define(
+    'adb_current_app',
+    'Report the foreground package and activity (browser "get url/title" equivalent) via dumpsys window mCurrentFocus — use it to confirm where you are before/after a navigation.',
+    { serial: serialArg, timeoutMs: tm15 },
+    async ({ serial, timeoutMs }) => {
+      const app = await currentApp(serial, timeoutMs);
+      return toolText(`${serial} foreground: ${app.package ?? 'unknown'}/${app.activity ?? '?'}`, { serial, package: app.package, activity: app.activity, focus: app.focus });
+    },
+  );
+
+  p.define(
+    'adb_open_app',
+    'Launch an installed app by package via the launcher intent (monkey), which cannot be MIME-hijacked. Verifies the launch and returns the app output.',
+    { serial: serialArg, package: z.string().min(1), timeoutMs: tm15 },
+    async ({ serial, package: pkg, timeoutMs }) => {
+      const r = await launchApp(serial, pkg, timeoutMs);
+      if (!r.ok) return toolError('REMOTE_ERROR', `launch of ${pkg} did not confirm: ${r.output.slice(0, 200)}`, { package: pkg, output: r.output }, 'confirm the package is installed with adb_apps and that it has a launcher activity');
+      return toolText(`launched ${pkg} on ${serial}`, { serial, package: pkg, output: r.output });
+    },
+  );
+
+  p.define(
+    'adb_open_url',
+    'Open an http(s) URL (browser "goto" equivalent). Only http(s) is accepted, and browserPackage pins the handler so a rogue MIME registration cannot swallow the link.',
+    { serial: serialArg, url: z.string().min(4), browserPackage: z.string().min(1).optional(), timeoutMs: tm15 },
+    async ({ serial, url, browserPackage, timeoutMs }) => {
+      const r = await openUrl(serial, url, browserPackage, timeoutMs);
+      if (!r.ok) return toolError('REMOTE_ERROR', `open_url ${url.slice(0, 80)} did not confirm: ${r.output.slice(0, 200)}`, { url: url.slice(0, 80), output: r.output }, browserPackage ? 'the browserPackage may not handle VIEW — try without it or check adb_apps' : 'pass browserPackage (e.g. com.android.chrome) to pin a handler');
+      return toolText(`opened ${url.slice(0, 80)} on ${serial}${browserPackage ? ` via ${browserPackage}` : ''}`, { serial, url, browserPackage: browserPackage ?? null, output: r.output });
+    },
+  );
+
+  p.define(
+    'adb_ls',
+    'List a device directory (filesystem access) into name/type/size/mode/mtime entries — parses ls -l. Absolute device path (e.g. /sdcard/DCIM/Camera).',
+    { serial: serialArg, remotePath: z.string().min(1), timeoutMs: tm15 },
+    async ({ serial, remotePath, timeoutMs }) => {
+      const entries = await listDir(serial, remotePath, timeoutMs);
+      return toolText(`${entries.length} entr(y|ies) in ${remotePath}:\n` + entries.map((e) => `${e.type}  ${String(e.size).padStart(10)}B  ${e.mtime}  ${e.name}`).join('\n'), { serial, remotePath, count: entries.length, entries });
+    },
+  );
+
+  p.define(
+    'adb_pull',
+    'Copy a file FROM the device to an absolute local path (streamed via adb pull; verifies the local file afterwards).',
+    { serial: serialArg, remotePath: z.string().min(1), localPath: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600000).default(60000) },
+    async ({ serial, remotePath, localPath, timeoutMs }) => {
+      requireAbsolute(localPath, 'localPath');
+      const r = await pullFile(serial, remotePath, localPath, timeoutMs);
+      return toolText(`pulled ${remotePath} -> ${localPath} (${r.bytes} bytes)`, { serial, remotePath, localPath, bytes: r.bytes });
+    },
+  );
+
+  p.define(
+    'adb_push',
+    'Copy a local file TO the device (streamed via adb push). Requires an existing absolute localPath and an absolute device remotePath.',
+    { serial: serialArg, localPath: z.string().min(1), remotePath: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600000).default(60000) },
+    async ({ serial, localPath, remotePath, timeoutMs }) => {
+      requireAbsolute(localPath, 'localPath');
+      const r = await pushFile(serial, localPath, remotePath, timeoutMs);
+      return toolText(`pushed ${localPath} -> ${remotePath} (${r.bytes} bytes)`, { serial, localPath, remotePath, bytes: r.bytes });
+    },
+  );
+
+  p.define(
+    'adb_apps',
+    'Inventory installed packages (app inventory). scope: all | system | third_party.',
+    { serial: serialArg, scope: z.enum(['all', 'system', 'third_party']).default('all'), timeoutMs: tm15 },
+    async ({ serial, scope, timeoutMs }) => {
+      const pkgs = await listApps(serial, scope as AppsScope, timeoutMs);
+      return toolText(`${pkgs.length} ${scope} package(s) on ${serial}:\n` + pkgs.join('\n'), { serial, scope, count: pkgs.length, packages: pkgs });
+    },
+  );
+
+  p.define(
+    'adb_settings',
+    'Read (no value) or write (with value) an Android settings key in the system|secure|global namespace. A write reads the value back and returns both, so success is measured, not assumed.',
+    { serial: serialArg, namespace: z.enum(['system', 'secure', 'global']), key: z.string().min(1), value: z.string().optional(), timeoutMs: tm15 },
+    async ({ serial, namespace, key, value, timeoutMs }) => {
+      if (value === undefined) {
+        const v = await getSetting(serial, namespace as SettingsNs, key, timeoutMs);
+        return toolText(`${namespace}/${key} = ${v === null ? '(unset)' : v}`, { serial, namespace, key, value: v });
+      }
+      const r = await putSetting(serial, namespace as SettingsNs, key, value, timeoutMs);
+      return toolText(`settings put ${namespace}/${key}: wrote "${r.written}", read-back "${r.readBack}"`, { serial, namespace, key, written: r.written, readBack: r.readBack, matched: r.readBack === r.written });
+    },
+  );
+
+  p.define(
+    'adb_media',
+    'Control the active media session (audio playback): play, pause, play-pause, next, previous, stop, rewind, fast-forward, volume_up/down/mute. Uses cmd media_session dispatch (routes to the live session) with a keyevent fallback, then returns the resulting now-playing state.',
+    { serial: serialArg, action: z.enum(['play', 'pause', 'play-pause', 'next', 'previous', 'stop', 'rewind', 'fast-forward', 'volume_up', 'volume_down', 'mute']), timeoutMs: tm15 },
+    async ({ serial, action, timeoutMs }) => {
+      const r = await mediaControl(serial, action, timeoutMs);
+      return toolText(`media ${action} on ${serial} via ${r.via}; now ${r.nowPlaying.active ? 'PLAYING' : 'not playing'}${r.nowPlaying.title ? `: ${r.nowPlaying.title}` : ''}`, { serial, action, via: r.via, nowPlaying: r.nowPlaying });
+    },
+  );
+
+  p.define(
+    'adb_media_state',
+    'Read the device media session: whether something is playing and its state/title/artist/package (best-effort; formats vary by OEM).',
+    { serial: serialArg, timeoutMs: tm15 },
+    async ({ serial, timeoutMs }) => {
+      const np = await nowPlaying(serial, timeoutMs);
+      return toolText(np.active ? `playing${np.title ? `: ${np.title}` : ''}${np.artist ? ` — ${np.artist}` : ''}${np.package ? ` (${np.package})` : ''}` : `no active media session on ${serial}`, { serial, ...np });
+    },
+  );
+
+  p.define(
+    'adb_screenrecord',
+    'Record a bounded silent video clip of the screen (screenrecord, max 180s/run) to an absolute local MP4 path. Honest: Android screenrecord captures NO audio; live streaming needs a scrcpy bridge, which this tool does not provide.',
+    { serial: serialArg, outputPath: z.string().min(1), durationMs: z.number().int().min(500).max(180000).default(5000), bitRateMbps: z.number().int().min(1).max(60).default(4), timeoutMs: z.number().int().min(3000).max(240000).default(30000) },
+    async ({ serial, outputPath, durationMs, bitRateMbps, timeoutMs }) => {
+      requireAbsolute(outputPath, 'outputPath');
+      const eff = Math.min(240000, Math.max(timeoutMs, durationMs + 30000));
+      const r = await recordScreen(serial, outputPath, durationMs, bitRateMbps, eff);
+      return toolText(`recorded ${r.durationMs}ms clip -> ${r.localPath} (${r.bytes} bytes) — ${r.note}`, { serial, outputPath, bytes: r.bytes, durationMs: r.durationMs, note: r.note });
+    },
+  );
+
+  p.define(
+    'adb_preset',
+    'Run a common one-shot device action so operators need not memorise key codes or shell incantations: home, back, recents, notification_shade, quick_settings, collapse_shade, camera_rear, camera_front. camera_front opens the camera and performs the selector-driven flip to the front lens, re-reading the hierarchy to CONFIRM it (not assume).',
+    { serial: serialArg, preset: z.enum(UI_PRESETS), timeoutMs: z.number().int().min(1000).max(60000).default(20000) },
+    async ({ serial, preset, timeoutMs }) => {
+      const r = await runUiPreset(serial, preset as UiPreset, timeoutMs);
+      if (!r.ok) return toolError('REMOTE_ERROR', `preset "${preset}" ran but was not verified: ${r.detail}`, { preset, observed: r.observed }, 'capture adb_screencap or adb_ui_dump to see the real on-screen state before retrying');
+      return toolText(`preset ${preset}: ${r.detail}${r.observed ? ` — ${r.observed}` : ''}`, { serial, ...r });
     },
   );
 

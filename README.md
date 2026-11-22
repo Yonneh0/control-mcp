@@ -52,7 +52,7 @@ Nothing is asserted that was not observed:
   `net_probe_tcp`, `wol_wake`, `arp_table`, `cdp_discover`) and the adb tools keep
   working with no config at all.
 
-## Tools (34)
+## Tools (51)
 
 **Host discovery**
 - `host_list` — configured hosts (name, address, os, alternate addresses, declared
@@ -111,12 +111,41 @@ tools refuse rather than guess which session to drive.
 - `monitor_start` / `monitor_stop` / `monitor_list` / `monitor_events` — poll and
   drain; see *Monitor* below.
 
-**Android** (`adb`)
-- `adb_status` — is `adb` there, which version, which devices (and honestly
+**Android** (`adb`) — these mirror the browser-control model (*snapshot → find →
+click-by-target → verify*) so the same muscle memory drives a real device, and
+every screen action targets parsed `uiautomator` nodes rather than guessed
+pixels.
+- `adb_status` — is `adb` there, which version, which devices (honestly
   `available: false` when the CLI is not installed).
-- `adb_exec`, `adb_screencap` (PNG signature **and** trailing IEND required),
-  `adb_tap`, `adb_swipe`, `adb_type` (restricted to `[A-Za-z0-9 ._-]`, spaces as
-  `%s`), `adb_root` (a device refusing root is reported, not hidden).
+- Core — `adb_exec` (shell), `adb_screencap` (PNG signature **and** trailing IEND
+  required), `adb_tap`, `adb_swipe`, `adb_type` (`[A-Za-z0-9 ._-]`, spaces as
+  `%s`), `adb_key` (named keys `home`/`back`/`recents`/`media_*`/`dpad_*` or a
+  numeric code), `adb_root` (a device refusing root is reported, not hidden).
+- UI control — `adb_ui_dump` (structured element tree), `adb_ui_find` (by text /
+  content-desc / resource-id / class), `adb_ui_tap` (tap a node **by selector**,
+  self-correcting versus coordinate guessing), `adb_ui_set_text` (focus-by-
+  selector + type; appends and cannot reliably clear — stated, not hidden).
+- Navigation — `adb_current_app` (foreground package/activity), `adb_open_app`
+  (launch by package), `adb_open_url` (http(s) only; `browserPackage` pins the
+  handler so a rogue MIME registration cannot hijack the link).
+- Presets — `adb_preset`: `home`, `back`, `recents`, `notification_shade`,
+  `quick_settings`, `collapse_shade`, `camera_rear`, `camera_front` (the last
+  opens the camera and performs the selector flip, then re-reads the hierarchy to
+  **confirm** it landed rather than assuming it did).
+- Files — `adb_ls`, `adb_pull`, `adb_push` (streamed; the local file is verified
+  after a pull).
+- Inventory & settings — `adb_apps` (all | system | third_party), `adb_settings`
+  (get/put `system|secure|global`; a put **reads the value back** and reports
+  whether it matched the write).
+- Media & video — `adb_media` (control the active session via
+  `cmd media_session dispatch` with a keyevent fallback), `adb_media_state`
+  (now-playing, best-effort), `adb_screenrecord` (bounded silent clip, ≤180 s).
+  Honest limits: `screenrecord` captures **no audio** on Android, and live video
+  streaming needs a scrcpy bridge — neither is claimed.
+
+> The Windows-desktop browser-equivalent — a real UIAutomation element tree over
+> RDP instead of blind `rdp_click x,y` — is deliberate future work; the Android
+> side is the complete model today.
 
 **Power** (loud by design)
 - `host_reboot` / `host_shutdown` — require `confirm: "yes"`, refuse any host that
@@ -128,7 +157,7 @@ tools refuse rather than guess which session to drive.
 
 ```
 src/index.ts            stdio MCP server (stdout is JSON-RPC only; stderr is the log)
-src/tools/registry.ts   the 34 tools + the audited pipeline: zod -> safety gate -> transport
+src/tools/registry.ts   the 51 tools + the audited pipeline: zod -> safety gate -> transport
 src/config/             TOML config: schema (zod, .strict()), loader, secret resolution
 src/transports/ssh.ts       ssh2 exec, persistent shell sessions (in-band sentinel), SFTP streaming
 src/transports/netprobe.ts  ping / TCP probe / ARP / Wake-on-LAN / CDP raw-frame listener / RDP policy probe
@@ -189,7 +218,14 @@ first use.
 is `adb_status → available: false` and `CAPABILITY_UNAVAILABLE` on the operations
 that need it; screencaps that lack a PNG signature or the trailing IEND chunk are
 rejected instead of written as unopenable files; a killed child keeps its partial
-output and reports the signal.
+output and reports the signal. UI tools parse `uiautomator` XML into a node tree so
+taps/fills target elements, not coordinates; file ops stream via `adb pull`/`push`
+and verify the local file; a settings write reads the value back. Actions use
+explicit components and system services (`uiautomator`, `media_session dispatch`,
+`monkey` launcher) rather than MIME `VIEW` intents, because on a real device any
+installed app can register a MIME type and silently hijack a generic `VIEW` (an
+audio `VIEW` here was swallowed by Termux and played nothing) — a lesson baked into
+the design.
 
 **Screen capture and input on Windows** — `winsnapshot.ts` renders a window with
 `PrintWindow` (trying `PW_RENDERFULLCONTENT` first, which DWM-composited windows
