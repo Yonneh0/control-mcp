@@ -1,0 +1,33 @@
+# Two hosts, one explicit default, and no [safety] section at all: the loader
+# test asserts exactly which defaults the schema then invents.
+defaultHost = "shop-floor"
+
+[[hosts]]
+name = "shop-floor"
+address = "10.0.0.7"
+os = "linux"
+alternateAddresses = ["10.0.0.9", "10.0.0.10"]
+
+[hosts.ssh]
+user = "builder"
+privateKeyPath = "/home/builder/.ssh/id_ed25519"
+
+[[hosts]]
+name = "press-room"
+address = "192.168.4.20"
+os = "windows"
+
+[hosts.ssh]
+user = "operator"
+privateKeyPath = "C:/Users/operator/.ssh/id_ed25519"
+
+[hosts.rdp]
+user = "operator"
+domain = "CONTOSO"
+credentialTarget = "TERMSRV/press-room"
+passwordEnv = "CONTROL_MCP_PW_PRESS_ROOM"
+width = 1280
+height = 720
+
+[hosts.capabilities]
+rdp = true

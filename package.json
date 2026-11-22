@@ -1,0 +1,36 @@
+{
+  "name": "control-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for full remote control of LAN hosts over SSH and scripted RDP, with honest capability reporting.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "control-mcp": "build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && shx chmod +x build/*.js",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "cross-env CONTROL_MCP_DISABLE_MAIN=1 vitest --run",
+    "test:unit": "cross-env CONTROL_MCP_DISABLE_MAIN=1 vitest --run test/unit/",
+    "test:e2e": "cross-env CONTROL_MCP_DISABLE_MAIN=1 vitest --run test/e2e/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "koffi": "^3.3.8",
+    "smol-toml": "^1.7.1",
+    "ssh2": "^1.17.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ssh2": "^1.15.5",
+    "cross-env": "^10.1.0",
+    "shx": "^0.4.0",
+    "typescript": "^5.9.2",
+    "vitest": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  }
+}

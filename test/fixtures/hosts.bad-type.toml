@@ -1,0 +1,11 @@
+# ssh.port is a string here, so the loader must refuse and point at
+# hosts.0.ssh.port rather than coercing "22" into a port.
+[[hosts]]
+name = "shop-floor"
+address = "10.0.0.7"
+os = "linux"
+
+[hosts.ssh]
+user = "builder"
+privateKeyPath = "/home/builder/.ssh/id_ed25519"
+port = "22"
