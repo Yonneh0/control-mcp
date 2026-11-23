@@ -1,13 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { SshTransport, errCodeFromSsh } from '../src/transports/ssh.js';
+import { SshTransport, errCodeFromSsh, sentinelFor, wrapShellCommand, parseShellResult } from '../src/transports/ssh.js';
 import { ControlError } from '../src/errors.js';
 import type { ErrCode } from '../src/errors.js';
 import type { HostConfig } from '../src/config/schema.js';
 
-// The completion sentinel (SENTINEL_MARK and sentinelFor) is module-private, so
-// the parts of the protocol a unit test can reach without a live host are the
-// error mapping around it and the session lookups that run before any socket is
-// opened.
+// The sentinel framing is now pure, exported helpers (sentinelFor /
+// wrapShellCommand / parseShellResult), so the cross-talk safety that used to
+// need a live host is unit-testable; the live half still skips without a host.
 const U = 'sh-never-opened';
 
 describe('errCodeFromSsh', () => {
@@ -21,6 +20,53 @@ describe('errCodeFromSsh', () => {
     expect(errCodeFromSsh(new Error('socket hang up'))).toBe('INTERNAL');
     expect(errCodeFromSsh('a bare string')).toBe('INTERNAL');
     expect(errCodeFromSsh(undefined)).toBe('INTERNAL');
+  });
+});
+
+describe('sentinel framing (per-command marker)', () => {
+  it('gives every command in a session a UNIQUE marker (the recovery guarantee)', () => {
+    // With a per-session marker (the old design) two commands shared one string,
+    // so a late marker could not be told from the next command's — the reason a
+    // timeout used to poison the session. A distinct seq is what prevents it.
+    expect(sentinelFor('sh-1', 1)).not.toBe(sentinelFor('sh-1', 2));
+    expect(sentinelFor('sh-1', 1)).toBe('CTL_MCP_sh-1_1_END');
+    expect(sentinelFor('sh/we#ird', 9)).toBe('CTL_MCP_shweird_9_END'); // sanitised, shell/regex-safe
+  });
+
+  it('wraps the command so the shell prints the marker with its exit code', () => {
+    const w = wrapShellCommand('ls -l', sentinelFor('sh-1', 3));
+    expect(w.startsWith('ls -l\n')).toBe(true);
+    expect(w).toContain('"$?"');
+    expect(w).toContain('CTL_MCP_sh-1_3_END');
+    expect(w.endsWith('2>/dev/null\n')).toBe(true);
+  });
+
+  it('resolves only on THIS command marker, not a stale one from a prior command', () => {
+    const stale = sentinelFor('sh-1', 4); // an earlier command that finished late
+    const active = sentinelFor('sh-1', 5);
+    // The old per-session code matched the FIRST marker in the buffer — the stale
+    // one — and would have wrongly returned exit 0 as the answer for command 5.
+    const onlyStale = `a\r\n${stale}0\r\nb is still running`;
+    expect(parseShellResult(onlyStale, active)).toBeNull();
+    // Once the ACTIVE marker completes, its own exit code is reported.
+    const done = `a\r\n${stale}0\r\nb\r\n${active}7\r\n`;
+    const res = parseShellResult(done, active);
+    expect(res?.exit).toBe('7');
+  });
+
+  it('does not resolve on the echoed wrapper fragment (%s, not digits)', () => {
+    const active = sentinelFor('sh-1', 6);
+    const echoFragment = `x\r\n{ printf '\\n${active}%s\\n' "$?" 2>/dev/null || echo ${active}?; } 2>/dev/null\r\n`;
+    expect(parseShellResult(echoFragment, active)).toBeNull();
+  });
+
+  it('cuts the echoed wrapper line out of the reported output', () => {
+    const marker = sentinelFor('sh-1', 5);
+    const echo = `{ printf '\\n${marker}%s\\n' "$?" 2>/dev/null || echo ${marker}?; } 2>/dev/null`;
+    const buffer = `hello\r\n${echo}\r\n${marker}0\r\n`;
+    const res = parseShellResult(buffer, marker);
+    expect(res?.exit).toBe('0');
+    expect(res?.output).toBe('hello\r\n'); // wrapper echo excluded
   });
 });
 

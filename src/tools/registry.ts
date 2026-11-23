@@ -775,7 +775,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'shell_run',
-    'Run one command inside an open shell session (it keeps cwd and env); unknown or dead session ids fail with SESSION_GONE, and the safety gate applies like exec.',
+    'Run one command inside an open shell session (it keeps cwd and env). A timeout does NOT discard the session: the next shell_run interrupts the stuck foreground job and resynchronises to a clean prompt, preserving cwd/env; only a shell that refuses to be interrupted (a SIGINT-ignoring hang) needs shell_close + shell_open. Unknown/dead session ids fail with SESSION_GONE, and the safety gate applies like exec.',
     {
       id: z.string().min(1).describe('Session id from shell_open'),
       command: z.string().min(1),
@@ -789,19 +789,25 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       await p.safetyGate(h, 'shell_run', command, override);
       const res = await ssh.runInShell(id, command, timeoutMs);
       if (res.timedOut) {
-        return toolError('TIMEOUT', `shell_run on ${id} did not complete before the timeout; the session is now desynchronized. Last output:\n${res.output}`, { id, closed: res.closed, timedOut: true }, 'the command may still be running on the host; its output/exit can no longer be attributed, so open a fresh session with shell_open before running more commands');
+        return toolError(
+          'TIMEOUT',
+          `shell_run on ${id} did not complete before the timeout; this command's output/exit cannot be attributed. The session is KEPT — the next shell_run interrupts the stuck command and resynchronises (cwd/env preserved).\nLast output:\n${res.output}`,
+          { id, closed: res.closed, timedOut: true },
+          'retry shell_run on the same id to recover it (it interrupts the leftover command first); if it keeps timing out the job ignores Ctrl-C or is still streaming — shell_close then shell_open a fresh session.',
+        );
       }
-      return toolText(res.output, { id, closed: res.closed, output: res.output });
+      const note = res.resynced ? '[session resynchronised after a previous timeout; cwd/env preserved]\n' : '';
+      return toolText(note + res.output, { id, closed: res.closed, output: res.output, resynced: res.resynced });
     },
   );
 
   p.noArgs(
     'shell_list',
-    'List open shell sessions (id, host, open/closed) so ids can be found and reused; an empty list honestly means none are open.',
+    'List open shell sessions (id, host, open/closed, and whether one needs resynchronisation after a timeout) so ids can be found and reused; an empty list honestly means none are open.',
     () => {
       const list = ssh.listSessions();
       return toolText(
-        list.map((s) => `${s.id} ${s.host} ${s.closed ? 'closed' : 'open'} last-used=${new Date(s.lastUsedAt).toISOString()}`).join('\n') || 'no shell sessions are open',
+        list.map((s) => `${s.id} ${s.host} ${s.closed ? 'closed' : 'open'}${s.needsResync ? ' [recoverable-after-timeout]' : ''} last-used=${new Date(s.lastUsedAt).toISOString()}`).join('\n') || 'no shell sessions are open',
         { sessions: list },
       );
     },

@@ -25,12 +25,17 @@ export interface ShellSession {
   cwd: string | null;
   channel: ClientChannel;
   buffer: string;
-  pending: Array<{ resolve: (v: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>;
+  pending: Array<{ marker: string; resolve: (v: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>;
   closed: boolean;
-  /** Set once a command times out. The timed-out command's sentinel can still
-   *  arrive and be matched by the NEXT command, so a desynced session refuses
-   *  further commands instead of reporting another command's output/exit. */
-  desynced?: boolean;
+  /** Incremented per command so every command gets a unique sentinel. That is
+   *  what lets a session recover after a timeout: a late marker from an earlier,
+   *  unfinished command can never be mistaken for the next command's. */
+  cmdSeq: number;
+  /** Set when a command timed out. The next shell_run first interrupts the stuck
+   *  foreground job (Ctrl-C) and resynchronises to a clean prompt, discarding
+   *  stale output; cwd/env are preserved, so the session is reused rather than
+   *  discarded. Cleared once a clean prompt is confirmed. */
+  needsResync?: boolean;
   /** True when the shell buffer was head-dropped over the capture cap. */
   droppedFromBuffer?: boolean;
 }
@@ -41,14 +46,42 @@ export interface TransferProgress {
 }
 
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
-// In-band completion sentinel for shell sessions: after every command we write
-// `printf` of a marker with the exit code, and only resolve when that marker
-// line arrives. Command output containing the literal marker text is extremely
-// unlikely; the marker includes a per-session nonce so cross-talk is impossible.
-const SENTINEL_MARK = 'CTL_MCP_END';
+// In-band completion sentinel for shell sessions: after every command the shell
+// prints a marker line carrying the exit code, and the reader resolves only on
+// that line. The marker is UNIQUE PER COMMAND (session id + an incrementing
+// command sequence), not per session — that is what lets a session recover after
+// a command times out: a stale marker from the earlier, unfinished command can
+// never be mistaken for the next command's, so the shell is reused (keeping its
+// cwd and environment) instead of being discarded.
+const RESYNC_SETTLE_MS = 200; // let the line editor settle after Ctrl-C
+const RESYNC_TIMEOUT_MS = 4000; // cap for the resync probe itself
 
-function sentinelFor(sessionId: string): string {
-  return `CTL_MCP_${sessionId.replace(/[^a-zA-Z0-9_-]/g, '')}_END`;
+// The marker for command <seq> in <sessionId>, sanitised to regex- and
+// shell-safe characters (letters/digits/underscore).
+export function sentinelFor(sessionId: string, seq: number): string {
+  const s = sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
+  return `CTL_MCP_${s}_${seq}_END`;
+}
+
+// The line written to the shell: run <command>, then print the marker with the
+// command's exit code. printf captures $? portably; the `|| echo <marker>?`
+// fallback covers shells (cmd.exe) with no $?/printf, where the reader still
+// sees the marker (with a literal '?') and knows the command reached the end.
+export function wrapShellCommand(command: string, marker: string): string {
+  return `${command}\n{ printf '\\n${marker}%s\\n' "$?" 2>/dev/null || echo ${marker}?; } 2>/dev/null\n`;
+}
+
+// Scan <buffer> for THIS command's completed marker. Returns the exit code and
+// the output up to (excluding) the echoed wrapper line, or null if the marker
+// has not completed. Only <marker> matches, so a stale marker from a different
+// command — a timed-out command that finished late — is ignored, not attributed.
+export function parseShellResult(buffer: string, marker: string): { exit: string; output: string } | null {
+  const re = new RegExp(`\\n${marker}(\\d+)\\r?\\n`);
+  const m = re.exec(buffer);
+  if (!m) return null;
+  const echoAt = buffer.lastIndexOf(`{ printf '\\n${marker}`);
+  const cut = echoAt >= 0 && echoAt < m.index ? echoAt : m.index;
+  return { exit: m[1], output: buffer.slice(0, cut) };
 }
 
 function mapAuthError(err: Error): ControlError {
@@ -347,6 +380,7 @@ export class SshTransport {
       buffer: '',
       pending: [],
       closed: false,
+      cmdSeq: 0,
     };
     channel.on('data', (d: Buffer) => this.onShellData(session, d.toString('utf8')));
     channel.stderr.on('data', (d: Buffer) => this.onShellData(session, d.toString('utf8')));
@@ -383,73 +417,87 @@ export class SshTransport {
     // matches this. The echo of the wrapped printf itself is stripped below.
     const waiters = session.pending;
     if (waiters.length === 0) return;
-    const needle = sentinelFor(session.id);
-    const re = new RegExp(`\\n${needle}(\\d+)\\r?\\n`);
-    const m = re.exec(session.buffer);
-    if (!m) return;
-    const at = m.index;
-    // Cut the output at the echoed wrapper line for this command (the shell
-    // prints our sentinel block right after echoing it back), so callers see
-    // only their command's output.
-    const echoAt = session.buffer.lastIndexOf(`{ printf '\\n${needle}`);
-    const cut = echoAt >= 0 && echoAt < at ? echoAt : at;
-    const output = session.buffer.slice(0, cut);
+    // Match only the CURRENT command's marker. A stale marker from a different
+    // command (e.g. one that timed out earlier and finished late) is never seen
+    // here — which is exactly what makes post-timeout recovery safe.
+    const w = waiters[0];
+    const res = parseShellResult(session.buffer, w.marker);
+    if (!res) return;
     session.buffer = '';
-    waiters.splice(0, waiters.length).forEach((w) => {
-      clearTimeout(w.timer);
-      const note = session.droppedFromBuffer
-        ? '\n[output exceeded the 2 MiB capture cap; earlier bytes were dropped]'
-        : '';
-      session.droppedFromBuffer = false;
-      w.resolve(output + `\n[exit ${m[1]}]` + note);
-    });
+    clearTimeout(w.timer);
+    session.pending.splice(0, 1);
+    const note = session.droppedFromBuffer
+      ? '\n[output exceeded the 2 MiB capture cap; earlier bytes were dropped]'
+      : '';
+    session.droppedFromBuffer = false;
+    w.resolve(res.output + `\n[exit ${res.exit}]` + note);
   }
 
-  private waitPrompt(session: ShellSession, timeoutMs: number): Promise<string> {
+  // Wait for a specific command's marker. Resolves {output, timedOut}; on a
+  // timeout it does NOT poison the session (recovery happens on the next
+  // runInShell) — the stale marker is simply left unmatched, because every
+  // command's marker is unique.
+  private waitMarker(session: ShellSession, marker: string, timeoutMs: number): Promise<{ output: string; timedOut: boolean }> {
     return new Promise((resolve, reject) => {
       if (session.closed) return reject(new ControlError('SESSION_GONE', `Shell session ${session.id} closed`));
       const timer = setTimeout(() => {
         const idx = session.pending.findIndex((p) => p.timer === timer);
         if (idx >= 0) session.pending.splice(idx, 1);
-        // The command may still be running and its sentinel will arrive later;
-        // that stale marker would otherwise be matched by the NEXT command.
-        // Mark the session desynced so runInShell refuses to keep using it.
-        session.desynced = true;
         const out = session.buffer;
         session.buffer = '';
-        resolve(out + '\n[timeout: sentinel not seen; command may still be running]');
+        resolve({ output: out + '\n[timeout: sentinel not seen; command may still be running]', timedOut: true });
       }, timeoutMs);
-      session.pending.push({
-        resolve,
-        reject,
-        timer,
-      });
+      session.pending.push({ marker, resolve: (v) => resolve({ output: v, timedOut: false }), reject, timer });
     });
   }
 
-  async runInShell(sessionId: string, command: string, timeoutMs = 30000): Promise<{ output: string; closed: boolean; timedOut: boolean }> {
+  // Bring a session that timed out back to a clean prompt WITHOUT discarding it:
+  // interrupt the stuck foreground job with Ctrl-C, let the line editor settle,
+  // then run a unique probe whose marker proves the shell is idle again. The
+  // interactive shell's cwd and environment survive the interrupt, so context is
+  // kept. Returns false only if the shell stays wedged (a SIGINT-ignoring hang),
+  // in which case the caller must close the session.
+  private async resyncShell(session: ShellSession, timeoutMs: number): Promise<boolean> {
+    session.channel.write('\x03');
+    await new Promise<void>((r) => setTimeout(r, RESYNC_SETTLE_MS));
+    session.buffer = '';
+    const probe = sentinelFor(session.id, ++session.cmdSeq);
+    session.channel.write(wrapShellCommand('true', probe));
+    const { timedOut } = await this.waitMarker(session, probe, timeoutMs);
+    return !timedOut;
+  }
+
+  async runInShell(sessionId: string, command: string, timeoutMs = 30000): Promise<{ output: string; closed: boolean; timedOut: boolean; resynced: boolean }> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new ControlError('SESSION_GONE', `No such shell session: ${sessionId}`);
     if (session.closed) throw new ControlError('SESSION_GONE', `Shell session ${sessionId} is closed`);
-    if (session.desynced) {
-      throw new ControlError('SESSION_GONE', `Shell session ${sessionId} is desynchronized after a timed-out command; its output and exit code can no longer be attributed. Close and open a new session.`);
-    }
     if (session.pending.length > 0) {
       throw new ControlError('BAD_ARGS', `Shell session ${sessionId} still has a command in flight; wait for it or close the session`);
     }
     session.lastUsedAt = Date.now();
-    // Sentinel: a marker line printed by the shell itself after the command,
-    // carrying $?. The echo of this very line is wrapped mid-stream so it can
-    // never match the real sentinel pattern. printf is used without %s because
-    // dash's printf does not honor \\\\ escapes inside single quotes; cmd.exe has
-    // no $? and gets the bare marker.
-    const sentinel = sentinelFor(session.id);
-    const wrapped = `${command}\n{ printf '\\n${sentinel}%s\\n' "$?" 2>/dev/null || echo ${sentinel}?; } 2>/dev/null\n`;
-    session.channel.write(wrapped);
-    const output = await this.waitPrompt(session, timeoutMs);
-    // desynced is set only by the timeout branch (across this await), and entry
-    // refused a pre-desynced session, so here it is exactly "this call timed out".
-    return { output, closed: session.closed, timedOut: Boolean(session.desynced) };
+    let resynced = false;
+    if (session.needsResync) {
+      // A previous command timed out and the shell may still be busy with it.
+      // Recover in place (cwd/env preserved) rather than discarding the session.
+      const ok = await this.resyncShell(session, Math.min(timeoutMs, RESYNC_TIMEOUT_MS));
+      if (!ok) {
+        session.needsResync = true;
+        throw new ControlError(
+          'SESSION_GONE',
+          `Shell session ${sessionId} is still busy after an interrupt — the earlier timed-out command did not stop, so its output/exit cannot be attributed and further commands would queue behind it.`,
+          { sessionId },
+          'close this session with shell_close and open a fresh one; the stuck command may ignore Ctrl-C or still be streaming output, so do not keep sending commands here.',
+        );
+      }
+      resynced = true;
+    }
+    // Each command gets a unique marker (session id + command sequence), so a
+    // late marker from a previous command can never be attributed to this one.
+    const marker = sentinelFor(session.id, ++session.cmdSeq);
+    session.channel.write(wrapShellCommand(command, marker));
+    const { output, timedOut } = await this.waitMarker(session, marker, timeoutMs);
+    session.needsResync = timedOut;
+    return { output, closed: session.closed, timedOut, resynced };
   }
 
   getSession(id: string): ShellSession | undefined {
@@ -466,6 +514,8 @@ export class SshTransport {
       lastUsedAt: s.lastUsedAt,
       cwd: s.cwd,
       closed: s.closed,
+      cmdSeq: s.cmdSeq,
+      needsResync: Boolean(s.needsResync),
     }));
   }
 
