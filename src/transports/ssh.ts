@@ -73,15 +73,24 @@ export function sentinelFor(sessionId: string, seq: number): string {
 // finished, exit captured" and "waiter hangs, the session looks stuck."
 export type ShellPlatform = 'posix' | 'windows';
 
-// The line written to the shell: run <command>, then print <marker> followed by
+// The lines written to the shell: run <command>, then print <marker> followed by
 // the command's exit code, so the reader knows the command reached its end.
 export function wrapShellCommand(command: string, marker: string, platform: ShellPlatform = 'posix'): string {
   if (platform === 'windows') {
     // cmd.exe: a CRLF sequences the echo after the command; cmd expands
     // %errorlevel% to the previous command's exit code.
+    // (No stdin guard here: cmd has no /dev/null. A command that blocks on
+    // stdin on cmd.exe still surfaces as a timeout + resync, never a fake exit.)
     return `${command}\r\necho ${marker}%errorlevel%\r\n`;
   }
-  return `${command}\n{ printf '\\n${marker}%s\\n' "$?" 2>/dev/null || echo ${marker}?; } 2>/dev/null\n`;
+  // POSIX: braces run the group in the LIVE shell (cd/env persist — parens would
+  // lose them), and `< /dev/null` takes stdin off the tty for the whole group.
+  // Without it, a command that reads stdin (nested ssh, read, bare wc/cat)
+  // consumes the queued marker line written just below it, so the command
+  // finishes with the marker NEVER printed and the reader reports a false
+  // TIMEOUT over an idle prompt (issue #1). The closing brace sits on its own
+  // line so a command ending in `&` still parses.
+  return `{\n${command}\n} < /dev/null\n{ printf '\\n${marker}%s\\n' "$?" 2>/dev/null || echo ${marker}?; } 2>/dev/null\n`;
 }
 
 // Scan <buffer> for THIS command's completed marker (`\n<marker><digits>`).

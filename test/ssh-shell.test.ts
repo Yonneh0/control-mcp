@@ -35,10 +35,42 @@ describe('sentinel framing (per-command marker)', () => {
 
   it('wraps the command so the shell prints the marker with its exit code', () => {
     const w = wrapShellCommand('ls -l', sentinelFor('sh-1', 3));
-    expect(w.startsWith('ls -l\n')).toBe(true);
+    expect(w.startsWith('{\nls -l\n')).toBe(true);
     expect(w).toContain('"$?"');
     expect(w).toContain('CTL_MCP_sh-1_3_END');
     expect(w.endsWith('2>/dev/null\n')).toBe(true);
+  });
+
+  // Issue #1: the marker line used to sit on the tty directly behind the
+  // command, so anything reading stdin (nested ssh, read, bare wc) CONSUMED it —
+  // the command then finished with the marker never printed and the reader saw a
+  // false TIMEOUT over an idle prompt. The command group now runs with stdin off
+  // the tty (`} < /dev/null`), so the marker line can never be eaten. Fails on
+  // the old `command\n{ printf … }` framing: that line had no stdin redirect.
+  it('runs the command with stdin redirected so it CANNOT eat the marker line (issue #1)', () => {
+    const w = wrapShellCommand('ssh root@other id', sentinelFor('sh-1', 7));
+    expect(w).toContain('} < /dev/null\n');
+    // Braces (live shell, cwd/env persist), never a subshell.
+    expect(w.startsWith('{\n')).toBe(true);
+    // Closing brace alone on its line: a command ending in `&` still parses.
+    expect(wrapShellCommand('sleep 1 &', 'M')).toContain('sleep 1 &\n} < /dev/null\n');
+    // The marker line follows the redirected group, outside it.
+    const markerAt = w.indexOf('{ printf');
+    const redirAt = w.indexOf('} < /dev/null');
+    expect(redirAt).toBeGreaterThan(-1);
+    expect(markerAt).toBeGreaterThan(redirAt);
+  });
+
+  // What bash now emits for the issue's repro class: the group runs with stdin
+  // at EOF, `read` gets EOF (honest exit 1), and the marker still prints — where
+  // before, `read` had eaten the marker line and no amount of waiting resolved.
+  it('parses a marker after a stdin-eating command that exited cleanly', () => {
+    const marker = sentinelFor('sh-2', 9);
+    const buffer =
+      `{\r\nread x\r\n} < /dev/null\r\nroot@um780:~# { printf '\\n${marker}%s\\n' "$?" 2>/dev/null; } 2>/dev/null\r\n` +
+      `\r\n${marker}1\r\nroot@um780:~# `;
+    const res = parseShellResult(buffer, marker);
+    expect(res?.exit).toBe('1'); // read's honest EOF exit, not a fabricated 0
   });
 
   it('resolves only on THIS command marker, not a stale one from a prior command', () => {

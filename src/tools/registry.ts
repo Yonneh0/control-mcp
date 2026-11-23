@@ -775,7 +775,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'shell_run',
-    'Run one command inside an open shell session (it keeps cwd and env). A timeout does NOT discard the session: the next shell_run interrupts the stuck foreground job and resynchronises to a clean prompt, preserving cwd/env; only a shell that refuses to be interrupted (a SIGINT-ignoring hang) needs shell_close + shell_open. Unknown/dead session ids fail with SESSION_GONE, and the safety gate applies like exec.',
+    'Run one command inside an open shell session (it keeps cwd and env). Commands run with stdin redirected from /dev/null — there is no interactive stdin (this also makes completion detection reliable for commands like nested ssh that would otherwise consume the tty). A timeout does NOT discard the session: the next shell_run interrupts the stuck foreground job and resynchronises to a clean prompt, preserving cwd/env; only a shell that refuses to be interrupted (a SIGINT-ignoring hang) needs shell_close + shell_open. Unknown/dead session ids fail with SESSION_GONE, and the safety gate applies like exec.',
     {
       id: z.string().min(1).describe('Session id from shell_open'),
       command: z.string().min(1),
