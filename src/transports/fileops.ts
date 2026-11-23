@@ -167,8 +167,11 @@ export function parseFindOutput(stdout: string, maxResults: number): GlobItem[] 
   return newestFirstCap(items, maxResults);
 }
 
-// Ticks (100ns since 0001-01-01) to Unix epoch ms; 11644473600000 is the offset.
-const WIN_TICKS_TO_UNIX_MS = 11644473600000;
+// .NET Ticks are 100ns intervals since 0001-01-01. /10000 gives ms since 0001;
+// subtract the 0001->1970 span in ms (62135596800000) to get Unix epoch ms.
+// NOT 11644473600000 — that is the FILETIME span, whose epoch is 1601-01-01;
+// pairing it with 0001-based Ticks yields dates ~1600 years in the future.
+const WIN_TICKS_TO_UNIX_MS = 62135596800000;
 
 // Parse '<ticks>\t<path>' lines from the PowerShell glob.
 export function parseWinGlobOutput(stdout: string, maxResults: number): GlobItem[] {

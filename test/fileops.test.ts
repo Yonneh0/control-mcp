@@ -232,8 +232,9 @@ describe('parseFindOutput', () => {
 });
 
 describe('parseWinGlobOutput', () => {
-  // 2023-11-14T22:13:22Z in ticks: (1700000002000 + 11644473600000) * 10000
-  const ticksFor = (ms: number): string => String((ms + 11644473600000) * 10000);
+  // .NET Ticks are 100ns since 0001-01-01; 62135596800000 is the 0001->1970 ms span.
+  // 2023-11-14T22:13:22Z (1700000002000 ms) => (1700000002000 + 62135596800000) * 10000 ticks.
+  const ticksFor = (ms: number): string => String((ms + 62135596800000) * 10000);
 
   it('converts ticks to mtimeMs and sorts newest-first', () => {
     const out = [
@@ -247,6 +248,14 @@ describe('parseWinGlobOutput', () => {
     expect(items.map((i) => i.path)).toEqual(['\\srv\\b.log', '\\srv\\a.log', '\\srv\\c.log']);
     expect(items[0].mtimeMs).toBe(1700000009000);
     expect(items[2].mtimeMs).toBe(1700000001000);
+  });
+
+  it('maps real .NET Ticks to the correct wall-clock year (guards the FILETIME/1601 mix-up)', () => {
+    // 638355968020000000 is the true DateTime.Ticks for 2023-11-14T22:13:22Z.
+    // Reintroducing the 1601-epoch FILETIME constant would shift this ~1600 years.
+    const items = parseWinGlobOutput('638355968020000000\tC:\\x.log', 10);
+    expect(items[0].mtimeMs).toBe(1700000002000);
+    expect(new Date(items[0].mtimeMs).toISOString()).toBe('2023-11-14T22:13:22.000Z');
   });
 
   it('caps at maxResults', () => {
