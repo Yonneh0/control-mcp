@@ -57,6 +57,20 @@ function needPattern(pattern: string): string {
   return p;
 }
 
+// An empty include is NOT "no filter". On Linux it becomes `--include=`, which
+// matches no file name at all (measured: grep exits 1 with no output for a search
+// that finds the file with '--include=*.txt' or with no filter at all); on Windows
+// it becomes `$_.Name -like ''`, which is never true. Both report "0 match(es)"
+// for a tree that was never searched, so refuse it and say what to pass instead.
+function needInclude(include: string | undefined): string | undefined {
+  if (include === undefined) return undefined;
+  const inc = needNoNul(include, 'include');
+  if (inc.length === 0) {
+    throw new ControlError('BAD_ARGS', 'include must not be empty', { include }, 'omit include to search every file, or give a file-name glob such as "*.ts"');
+  }
+  return inc;
+}
+
 // maxResults is the one value interpolated into a command line, so it must be a
 // real integer before it gets there.
 function needMaxResults(maxResults: number): number {
@@ -64,6 +78,34 @@ function needMaxResults(maxResults: number): number {
     throw new ControlError('BAD_ARGS', 'maxResults must be an integer >= 1', { maxResults });
   }
   return maxResults;
+}
+
+// PowerShell's -like reads [ ] * ? as wildcards, but the ROOT it is compared
+// against is a literal path: a directory really named 'logs[2024]' produced
+// -like 'C:\logs[2024]\*.log', which does not match the very path it came from
+// (measured in PowerShell: False, while 'C:\logs[[]2024[]]\*.log' is True), so the
+// tool reported "no matches" for a tree that exists. about_Wildcards: wrapping a
+// wildcard character in brackets makes it literal. One pass, so the brackets this
+// adds are never re-escaped.
+function likeLiteral(v: string): string {
+  return v.replace(/[[\]*?]/g, (c) => `[${c}]`);
+}
+
+// -ErrorAction SilentlyContinue is what keeps a permission-denied directory in the
+// middle of a recursive walk from aborting the whole query — and it also swallows
+// "the root does not exist". Measured with powershell.exe -EncodedCommand and a
+// missing root: exit 1 with NOTHING on stdout or stderr. file_search reads exit 1
+// as grep's "no matches" convention and answers "0 match(es)" for a path that was
+// never there; file_glob answers REMOTE_ERROR with no evidence in either stream.
+// So test the root by name and exit 2, which both callers already map to
+// REMOTE_ERROR, with the path in the message.
+function winRootGuard(root: string): string {
+  return (
+    `if (-not (Test-Path -LiteralPath ${psq(root)})) {\n` +
+    `  Write-Error ${psq(`root is missing or unreadable: ${root}`)}\n` +
+    `  exit 2\n` +
+    `}\n`
+  );
 }
 
 // ------------------------------------------------------------------ builders --
@@ -83,8 +125,9 @@ export function buildGlobCommand(os: OS, o: { root: string; pattern: string; fil
     // -like, '*' spans separators exactly like find's -path, so '**' collapses
     // the same way.
     const baseW = root.replace(/[\\/]+$/, '');
-    const fullW = `${baseW}\\${pattern.replace(/\*\*\//g, '*').replace(/\//g, '\\').replace(/\*+/g, '*')}`;
+    const fullW = `${likeLiteral(baseW)}\\${pattern.replace(/\*\*\//g, '*').replace(/\//g, '\\').replace(/\*+/g, '*')}`;
     return psCommand(
+      winRootGuard(root) +
       `Get-ChildItem -LiteralPath ${psq(root)} -Recurse -File -ErrorAction SilentlyContinue` +
       ` | Where-Object { $_.FullName -like ${psq(fullW)} }` +
       ` | Sort-Object LastWriteTimeUtc -Descending` +
@@ -98,24 +141,34 @@ export function buildGlobCommand(os: OS, o: { root: string; pattern: string; fil
   // directories) and any run of stars collapses to one. Exactly one slash joins
   // root and pattern (a trailing '/' on root would make '//pattern', which -path
   // would not match).
-  const base = root.replace(/\/+$/, '');
+  // A starting point whose first character is '-' is not a path to find: find parses
+  // it as an option or predicate. Measured with GNU findutils: `find '-data' -type f
+  // -path '-data/*'` → "unknown predicate `-data'" exit 1 (the directory exists but
+  // cannot be listed), and `find '-printf' …` → "paths must precede expression: `f'".
+  // A valid option spelling is worse than the error: '-P' is simply consumed as an
+  // option, find then searches '.' — a different tree — and reports no matches.
+  // find has no '--', so a leading './' is the portable guard; it goes into the
+  // -path pattern too, because -path must match the paths find actually prints.
+  const start = root.startsWith('-') ? `./${root}` : root;
+  const base = start.replace(/\/+$/, '');
   const fullPath = `${base}/${pattern.replace(/\*\*\//g, '*').replace(/\*+/g, '*')}`;
   // %T@ prints epoch seconds (fractional); \t separates it from %p, \0 ends the
   // record so paths containing newlines survive.
-  return `find ${shq(root)}${o.filesOnly ? ' -type f' : ''} -path ${shq(fullPath)} -printf ${shq('%T@\\t%p\\0')} 2>/dev/null`;
+  return `find ${shq(start)}${o.filesOnly ? ' -type f' : ''} -path ${shq(fullPath)} -printf ${shq('%T@\\t%p\\0')} 2>/dev/null`;
 }
 
 export function buildSearchCommand(os: OS, o: { root: string; pattern: string; include?: string; maxResults: number }): string {
   const pattern = needPattern(o.pattern);
   const max = needMaxResults(o.maxResults);
   const root = needNoNul(o.root, 'root');
-  const include = o.include === undefined ? undefined : needNoNul(o.include, 'include');
+  const include = needInclude(o.include);
 
   if (os === 'windows') {
     // Select-String takes a .NET regex — a different dialect from grep -E; the
     // tool description says so rather than pretending they are interchangeable.
-    const nameFilter = include ? `$_.Name -like ${psq(include)}` : '$true';
+    const nameFilter = include !== undefined ? `$_.Name -like ${psq(include)}` : '$true';
     return psCommand(
+      winRootGuard(root) +
       `Get-ChildItem -LiteralPath ${psq(root)} -Recurse -File -ErrorAction SilentlyContinue` +
       ` | Where-Object { ${nameFilter} }` +
       ` | Select-String -Pattern ${psq(pattern)} -ErrorAction SilentlyContinue` +
@@ -129,7 +182,21 @@ export function buildSearchCommand(os: OS, o: { root: string; pattern: string; i
   // early kills grep with SIGPIPE and hides the real outcome. Capping happens in
   // the parser.
   const inc = include === undefined ? '' : ` ${shq(`--include=${include}`)}`;
-  return `grep -rnI --color=never --exclude-dir=.git -E ${shq(pattern)}${inc} ${shq(root)}`;
+  // The pattern and the root are POSITIONAL operands, so one that begins with '-' is
+  // parsed by grep as options instead. Measured with GNU grep, both on a tree whose
+  // only file holds the single line "alpha":
+  //   grep -rnI --color=never --exclude-dir=.git -E '-vn' ./a.log
+  //     -> printed "a.log:1:alpha" and "-data/c.log:1:gamma": '-vn' became -v
+  //        (invert) + -n, the file argument became the pattern, and -r searched the
+  //        whole cwd — matches reported that were never asked for, in files that
+  //        were never named.
+  //   grep ... -E '-F<file>' ./a.log  -> "conflicting matchers specified", exit 2.
+  // '-e' binds the pattern operand and '--' ends option parsing before the root;
+  // each is added only when a value needs it, so the ordinary command line stays
+  // byte-identical (and the existing suite's pinned strings still hold).
+  const patArg = pattern.startsWith('-') ? `-e ${shq(pattern)}` : shq(pattern);
+  const rootArg = root.startsWith('-') ? `-- ${shq(root)}` : shq(root);
+  return `grep -rnI --color=never --exclude-dir=.git -E ${patArg}${inc} ${rootArg}`;
 }
 
 // ------------------------------------------------------------------- parsers --
@@ -173,7 +240,11 @@ export function parseFindOutput(stdout: string, maxResults: number): GlobItem[] 
 // pairing it with 0001-based Ticks yields dates ~1600 years in the future.
 const WIN_TICKS_TO_UNIX_MS = 62135596800000;
 
-// Parse '<ticks>\t<path>' lines from the PowerShell glob.
+// Parse '<ticks>\t<path>' lines from the PowerShell glob. The ticks field is what
+// PowerShell's "{0}" -f [long] writes: bare decimal digits and nothing else, so
+// require exactly that. Number() would also accept '  ', hex, exponent and sign
+// forms, and coercing one of those (a truncated or interleaved stream, say) invents
+// a timestamp — a whitespace-only field becomes 0, i.e. 1970-01-01.
 export function parseWinGlobOutput(stdout: string, maxResults: number): GlobItem[] {
   const items: GlobItem[] = [];
   for (const raw of stdout.split(/\r?\n/)) {
@@ -182,27 +253,35 @@ export function parseWinGlobOutput(stdout: string, maxResults: number): GlobItem
     if (tab <= 0) continue;
     const path = raw.slice(tab + 1);
     if (!path) continue;
-    const ticks = Number(raw.slice(0, tab));
+    const token = raw.slice(0, tab);
+    if (!/^\d+$/.test(token)) continue;
+    const ticks = Number(token);
     if (!Number.isFinite(ticks)) continue;
     items.push({ path, mtimeMs: Math.floor(ticks / 10000 - WIN_TICKS_TO_UNIX_MS) });
   }
   return newestFirstCap(items, maxResults);
 }
 
-// '<path>:<line>:<text>' — the text may itself contain ':', so split on the
-// first two colons only. Anything without a numeric second field (grep's
-// "Binary file X matches", a path with a stray colon) is skipped, not guessed.
+// '<path>:<line>:<text>' — the text may itself contain ':', so the separator is the
+// FIRST colon followed by digits and another colon (the same rule
+// parseWinSearchOutput uses). Splitting on the first two colons instead dropped a
+// real match for a file whose name contains ':' — POSIX allows it, so
+// 'dir/a:b.log:12:x' is one row, and a dropped row is reported as one match fewer
+// (or "0 match(es)"). Anything with no ':<digits>:' anywhere — grep's "Binary file
+// X matches" notice, a stray colon — is still skipped, never guessed.
 export function parseGrepOutput(stdout: string, maxResults: number): SearchMatch[] {
   const out: SearchMatch[] = [];
   for (const raw of stdout.split('\n')) {
     const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
     if (!line) continue;
-    const first = line.indexOf(':');
-    const second = line.indexOf(':', first + 1);
-    if (first <= 0 || second < 0) continue;
-    const n = line.slice(first + 1, second);
-    if (!/^\d+$/.test(n)) continue;
-    out.push({ path: line.slice(0, first), line: Number(n), text: line.slice(second + 1) });
+    for (let i = line.indexOf(':'); i >= 0; i = line.indexOf(':', i + 1)) {
+      const m = /^(\d+):/.exec(line.slice(i + 1));
+      if (!m) continue;
+      const path = line.slice(0, i);
+      if (!path) break;
+      out.push({ path, line: Number(m[1]), text: line.slice(i + 1 + m[0].length) });
+      break;
+    }
   }
   return out.slice(0, Math.max(0, maxResults));
 }

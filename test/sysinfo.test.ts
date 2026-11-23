@@ -192,6 +192,66 @@ describe('parseLinuxMetrics — honesty regressions', () => {
   });
 });
 
+describe('parseLinuxMetrics — malformed rows, ps headers and counter sanity', () => {
+  it('skips a ps header row instead of inventing a COMMAND process', () => {
+    // Some ps builds ignore the `comm=` header suppression; the header would
+    // otherwise enter topProcesses as a bogus process with all-null fields.
+    const withHeader = LINUX_STDOUT.replace('===PS===\n', '===PS===\nCOMMAND   PID %MEM %CPU\n');
+    const m = parseLinuxMetrics(withHeader);
+    expect(m.topProcesses).toHaveLength(4);
+    expect(m.topProcesses.some((p) => p.name === 'COMMAND')).toBe(false);
+    expect(m.topProcesses[0]).toEqual({ name: 'nginx', pid: 1234, memMb: 1992, cpuPct: 1.3 });
+  });
+
+  it('keeps a real process named COMMAND (a numeric pid position is not a header)', () => {
+    // Over-refusal guard: the header skip must not eat real rows.
+    const renamed = LINUX_STDOUT.replace('nginx              1234 12.5  1.3', 'COMMAND            1234 12.5  1.3');
+    const m = parseLinuxMetrics(renamed);
+    expect(m.topProcesses[0]).toEqual({ name: 'COMMAND', pid: 1234, memMb: 1992, cpuPct: 1.3 });
+    expect(m.warnings).toEqual([]);
+  });
+
+  it('warns and skips a df row with fewer than 6 fields', () => {
+    const short = LINUX_STDOUT.replace('/dev/loop0           51200     51200         0 100% /snap/core/1', '/dev/sdz 12345');
+    const m = parseLinuxMetrics(short);
+    expect(m.disks).toHaveLength(2);
+    expect(m.warnings.some((x) => x.includes('df row skipped'))).toBe(true);
+  });
+
+  it('nulls usedPct and warns when a df row has no parsable Capacity%', () => {
+    const noPct = LINUX_STDOUT.replace('/dev/sda1         49170820 31200100  15456200  67% /', '/dev/sda1         49170820 31200100  15456200     - /');
+    const m = parseLinuxMetrics(noPct);
+    expect(m.disks[0].usedPct).toBeNull();
+    expect(m.disks[0].totalMb).toBe(50351); // the sizes are still a measurement
+    expect(m.warnings.some((x) => x.includes('Capacity'))).toBe(true);
+  });
+
+  it('nulls memUsedMb instead of a negative when MemAvailable exceeds MemTotal', () => {
+    // Seen with cgroup/containers: the counters disagree. A negative "used" is
+    // not a measurement, and clamping to 0 would be a guess.
+    const bogus = LINUX_STDOUT.replace('MemAvailable:    8214520 kB', 'MemAvailable:    99999999 kB');
+    const m = parseLinuxMetrics(bogus);
+    expect(m.memTotalMb).toBe(15934);
+    expect(m.memUsedMb).toBeNull();
+    expect(m.warnings.some((x) => x.includes('MemAvailable exceeds MemTotal'))).toBe(true);
+  });
+
+  it('nulls swapUsedMb instead of a negative when SwapFree exceeds SwapTotal', () => {
+    const bogus = LINUX_STDOUT.replace('SwapFree:        3145728 kB', 'SwapFree:        99999999 kB');
+    const m = parseLinuxMetrics(bogus);
+    expect(m.swapTotalMb).toBe(4096);
+    expect(m.swapUsedMb).toBeNull();
+    expect(m.warnings.some((x) => x.includes('SwapFree exceeds SwapTotal'))).toBe(true);
+  });
+
+  it('reports an empty uptime body as unparsable, not as 0', () => {
+    const noUp = LINUX_STDOUT.replace('892134.56 1623411.02\n', '');
+    const m = parseLinuxMetrics(noUp);
+    expect(m.uptimeSec).toBeNull();
+    expect(m.warnings.some((x) => x.includes('uptimeSec'))).toBe(true);
+  });
+});
+
 // What the registry gets after extractJson() on ConvertTo-Json output.
 // CpuCount is a STRING because it comes from $env:NUMBER_OF_PROCESSORS.
 const WINDOWS_JSON = {
@@ -352,6 +412,155 @@ describe('parseWindowsMetrics — honesty regressions', () => {
     expect(m.warnings.some((x) => x.includes('no disk rows'))).toBe(true);
     expect(m.warnings.some((x) => x.includes('no process rows'))).toBe(true);
     expect(m.uptimeSec).toBe(274625);
+  });
+});
+
+// ---- PS 5.1 ConvertTo-Json date serialization (live-measured) ---------------
+// With `ConvertTo-Json -Compress -Depth 6`, Windows PowerShell 5.1 writes a
+// [DateTime] property in one of two shapes depending on where it came from:
+// the Microsoft-JSON string "\/Date(ms)\/", or an OBJECT. Live output on host
+// n100 (the reported failure — BOTH dates are objects):
+//   Now            = {"value":"\/Date(1795434601250)\/","DateTime":"Monday, November 23, 2026 11:50:01 AM"}
+//   LastBootUpTime = {"value":"\/Date(1795346693413)\/","DateTime":"Sunday, November 22, 2026 6:24:53 AM"}
+// Live output on host X1 (PS 5.1.26100 — CIM date a bare string, (Get-Date) an
+// object with an extra DisplayHint member):
+//   LastBootUpTime = "\/Date(1795362141500)\/"
+//   Now            = {"value":"\/Date(1795435307167)\/","DisplayHint":2,"DateTime":"Monday, November 23, 2026 7:01:47 AM"}
+// `\/` is the JSON escape for `/`, so after JSON.parse the string is
+// /Date(ms)/. The ms figure is already UTC; ±hhmm suffixes are display-only.
+describe('parseWindowsMetrics — PS 5.1 ConvertTo-Json date serialization', () => {
+  const withDates = (boot: unknown, now: unknown): unknown => ({
+    ...WINDOWS_JSON,
+    OS: { ...WINDOWS_JSON.OS, LastBootUpTime: boot },
+    Now: now,
+  });
+
+  it('parses the n100 payload where both dates are {"value":"/Date(ms)/"} objects', () => {
+    // 1795434601250 − 1795346693413 = 87907837 ms = 87907.837 s — the n100
+    // uptime the live host reported as "not measured".
+    const m = parseWindowsMetrics(
+      withDates(
+        { value: '/Date(1795346693413)/', DateTime: 'Sunday, November 22, 2026 6:24:53 AM' },
+        { value: '/Date(1795434601250)/', DateTime: 'Monday, November 23, 2026 11:50:01 AM' },
+      ),
+    );
+    expect(m.uptimeSec).toBe(87907.837);
+    expect(m.warnings).toEqual([]);
+  });
+
+  it('parses the live X1 mix: CIM date as a bare string, (Get-Date) as an object', () => {
+    // 1795435307167 − 1795362141500 = 73165667 ms = 73165.667 s
+    const m = parseWindowsMetrics(
+      withDates('/Date(1795362141500)/', { value: '/Date(1795435307167)/', DisplayHint: 2, DateTime: 'Monday, November 23, 2026 7:01:47 AM' }),
+    );
+    expect(m.uptimeSec).toBe(73165.667);
+    expect(m.warnings).toEqual([]);
+  });
+
+  it('reads /Date(ms+hhmm)/ inside the object and ignores the display offset', () => {
+    const m = parseWindowsMetrics(withDates({ value: '/Date(1000000000000+0000)/' }, { value: '/Date(1000274625000-0500)/' }));
+    expect(m.uptimeSec).toBe(274625);
+  });
+
+  it('accepts an ISO string or a bare epoch-ms number wherever a date appears', () => {
+    const iso = parseWindowsMetrics(withDates({ value: '2026-11-20T06:20:00.000Z' }, { value: '2026-11-23T10:37:05.000Z' }));
+    expect(iso.uptimeSec).toBe(274625);
+    const nums = parseWindowsMetrics(withDates(1000000000000, 1000274625000));
+    expect(nums.uptimeSec).toBe(274625);
+    expect(nums.warnings).toEqual([]);
+  });
+
+  it('never parses the locale display string — only the zone-bearing value', () => {
+    // {"DateTime":"Monday, November 23, 2026 11:50:01 AM"} carries no timezone
+    // and its interpretation is locale-dependent; using it could shift uptime
+    // by hours. An object without a usable .value stays unmeasured.
+    const m = parseWindowsMetrics(
+      withDates(
+        { DateTime: 'Sunday, November 22, 2026 6:24:53 AM' },
+        { value: 'soon', DateTime: 'Monday, November 23, 2026 11:50:01 AM' },
+      ),
+    );
+    expect(m.uptimeSec).toBeNull();
+    expect(m.warnings.some((x) => x.includes('LastBootUpTime and/or Now unparsable'))).toBe(true);
+    expect(m.memTotalMb).toBe(32640); // the rest of the OS payload is still real
+  });
+
+  it('still refuses a negative uptime when both dates arrive in object form', () => {
+    const m = parseWindowsMetrics(withDates({ value: '/Date(1000274625000)/' }, { value: '/Date(1000000000)/' }));
+    expect(m.uptimeSec).toBeNull();
+    expect(m.warnings.some((x) => x.includes('clock skew'))).toBe(true);
+  });
+});
+
+describe('parseWindowsMetrics — one-row payloads (object or array)', () => {
+  it('parses a single disk delivered as a bare object, not only as an array', () => {
+    // A one-row result can arrive as {...} rather than [...] (any producer that
+    // collapses a single-element collection). That is real measured data and
+    // must not be reported as "Win32_LogicalDisk returned nothing".
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Disks: { DeviceID: 'C:', Size: 511101104128, FreeSpace: 193273528320 } });
+    expect(m.disks).toHaveLength(1);
+    expect(m.disks[0]).toEqual({ mount: 'C:', filesystem: null, totalMb: 511101, usedMb: 317828, freeMb: 193274, usedPct: 62 });
+    expect(m.warnings).toEqual([]);
+  });
+
+  it('parses a single process delivered as a bare object', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Top: { Name: 'chrome', Id: 8812, WS: 1234567890 } });
+    expect(m.topProcesses).toHaveLength(1);
+    expect(m.topProcesses[0]).toEqual({ name: 'chrome', pid: 8812, memMb: 1235, cpuPct: null });
+    expect(m.warnings).toEqual([]);
+  });
+
+  it('warns when a section arrives as an empty array instead of staying silent', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Disks: [], Top: [] });
+    expect(m.disks).toEqual([]);
+    expect(m.topProcesses).toEqual([]);
+    expect(m.warnings).toContain('no disk rows (Win32_LogicalDisk returned nothing)');
+    expect(m.warnings).toContain('no process rows (Get-Process returned nothing)');
+  });
+
+  it('does not arrayify a whole-section string (depth truncation) into a bogus row', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Disks: 'System.Object[]', Top: 'System.Object[]' });
+    expect(m.disks).toEqual([]);
+    expect(m.topProcesses).toEqual([]);
+    expect(m.warnings).toContain('no disk rows (Win32_LogicalDisk returned nothing)');
+    expect(m.warnings).toContain('no process rows (Get-Process returned nothing)');
+  });
+
+  it('skips a depth-truncated non-object row inside an array with a warning', () => {
+    const m = parseWindowsMetrics({
+      ...WINDOWS_JSON,
+      Disks: [{ DeviceID: 'C:', Size: 1000000000, FreeSpace: 500000000 }, 'Microsoft.Management.Infrastructure.CimInstance#root/cimv2/Win32_LogicalDisk'],
+    });
+    expect(m.disks).toHaveLength(1);
+    expect(m.warnings).toContain('disk row is not an object, skipped');
+  });
+});
+
+describe('parseWindowsMetrics — counter sanity (never an impossible number)', () => {
+  it('nulls used/usedPct when FreeSpace exceeds Size instead of a negative', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Disks: [{ DeviceID: 'C:', Size: 1000000000, FreeSpace: 2000000000 }] });
+    expect(m.disks[0]).toEqual({ mount: 'C:', filesystem: null, totalMb: 1000, usedMb: null, freeMb: 2000, usedPct: null });
+    expect(m.warnings.some((x) => x.includes('C:') && x.includes('inconsistent'))).toBe(true);
+  });
+
+  it('nulls disk sizes instead of negatives when a CIM counter is negative', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, Disks: [{ DeviceID: 'E:', Size: -1, FreeSpace: 500000000 }] });
+    expect(m.disks[0]).toEqual({ mount: 'E:', filesystem: null, totalMb: null, usedMb: null, freeMb: 500, usedPct: null });
+    expect(m.warnings.some((x) => x.includes('inconsistent'))).toBe(true);
+  });
+
+  it('nulls memUsedMb when FreePhysicalMemory exceeds TotalVisibleMemorySize', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, OS: { ...WINDOWS_JSON.OS, FreePhysicalMemory: 99999999 } });
+    expect(m.memTotalMb).toBe(32640); // still measured
+    expect(m.memUsedMb).toBeNull(); // a negative "used" is a counter inconsistency
+    expect(m.warnings.some((x) => x.includes('FreePhysicalMemory exceeds TotalVisibleMemorySize'))).toBe(true);
+  });
+
+  it('nulls swapUsedMb when FreeVirtualMemory exceeds TotalVirtualMemorySize', () => {
+    const m = parseWindowsMetrics({ ...WINDOWS_JSON, OS: { ...WINDOWS_JSON.OS, FreeVirtualMemory: 99999999 } });
+    expect(m.swapTotalMb).toBe(39936); // still measured
+    expect(m.swapUsedMb).toBeNull();
+    expect(m.warnings.some((x) => x.includes('FreeVirtualMemory exceeds TotalVirtualMemorySize'))).toBe(true);
   });
 });
 

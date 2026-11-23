@@ -52,7 +52,7 @@ Nothing is asserted that was not observed:
   `net_probe_tcp`, `wol_wake`, `arp_table`, `cdp_discover`) and the adb tools keep
   working with no config at all.
 
-## Tools (59)
+## Tools (63)
 
 **Host discovery**
 - `host_list` — configured hosts (name, address, os, alternate addresses, declared
@@ -60,7 +60,15 @@ Nothing is asserted that was not observed:
 - `host_status` — probes one host over every configured interface: ping on each
   address, SSH handshake, TCP/3389, and (for a declared Windows RDP account) the
   live policy probe. Returns a per-interface verdict plus the RDP verdict with its
-  reason. Run it before any RDP tool when a box is unclear.
+  reason. It also separates **host** reachability (ping/ARP) from **SSH-service** reachability: a refused or filtered port on a host that pings means the box is up and only the daemon is down — it says so and tells you *not* to wake it. An RDP `prerequisites present` verdict means port + policy + credential are in place, not that a session is proven. Run it before any RDP tool, or whenever a box is unclear.
+
+**System metrics** (one SSH exec → a normalized snapshot; sizes are DECIMAL MB/GB; a
+field that can't be measured is `null` + a warning, never a guess)
+- `host_metrics` — hostname, uptime, load average (Linux only), CPU count, memory and
+  swap, per-mount disk usage, and the top processes by memory — for any SSH host (Linux
+  `/proc` + `df -P` + `ps`; Windows one `Get-CimInstance`). `loadAvg` is always `null`
+  on Windows (no such measure) and Windows per-process CPU% is `null` (the cheap
+  snapshot does not measure it).
 
 **Commands**
 - `exec` — one shell command over SSH; stdout/stderr/exit code/signal/truncation/
@@ -124,10 +132,10 @@ clumsily)
 
 **RDP** (Windows)
 - `rdp_connect` (`connect` / `disconnect` / `status`) — creates the in-process
-  MsRdpEx control and reports exactly what it achieved; see *RDP* below.
-- `rdp_screenshot` — `PrintWindow` of the RDP window to an absolute PNG path.
+  MsRdpEx control and reports exactly what it achieved. On the acceptance box even control *creation* fails (a measured HRESULT), so `connected=false` and there is no window to drive; it never fakes a session — see *RDP* below.
+- `rdp_screenshot` — `PrintWindow` of an **already-open** RDP window to an absolute PNG path.
 - `rdp_click` / `rdp_key` / `rdp_type` — window messages (`WM_*`, `WM_CHAR`) posted
-  to that window; coordinates are client-area relative.
+  to that window; coordinates are client-area relative. These drive a session that already exists (e.g. one opened with `mstsc`); they do not create one, and this server cannot open a scripted RDP session end-to-end (see *RDP* below).
 
 Which window: the handle `rdp_connect` recorded for that host, otherwise a
 machine-wide class lookup for the RDP host window class — used only when exactly
@@ -169,6 +177,10 @@ pixels.
   (now-playing, best-effort), `adb_screenrecord` (bounded silent clip, ≤180 s).
   Honest limits: `screenrecord` captures **no audio** on Android, and live video
   streaming needs a scrcpy bridge — neither is claimed.
+- Device state — `adb_device_state`: a compact health snapshot (battery level/status/
+  plugged/temperature, wakefulness + screen/doze state, airplane mode, brightness, and
+  free space on `/data`) in one call; each section is read independently, and one the
+  dump cannot yield is `null` and listed as unavailable, never guessed.
 
 > The Windows-desktop browser-equivalent — a real UIAutomation element tree over
 > RDP instead of blind `rdp_click x,y` — is deliberate future work; the Android
@@ -185,6 +197,17 @@ pixels.
 - `win_update` — `status` (pending count + top titles + `usoclient` availability via
   the Update COM API) and async `scan`/`download`/`install` via `usoclient`; no auto
   reboot, and progress is verified with `status` (usoclient's own exit code is unreliable).
+- `win_service` — `status` (list, or one service, with Name/DisplayName/Status/StartType,
+  `StartType` taken from `Win32_Service.StartMode`) | `start` / `stop` / `restart`. A
+  change resolves the target by **exact** name — never a wildcard, so `sshd*` cannot fan
+  out to other services — refuses with "nothing was changed" if it does not match exactly
+  one, then reads the state back and lets the **read-back**, not the exit code, decide
+  whether it succeeded. It refuses to stop/restart the services that carry this very SSH
+  path (`sshd`, `termservice`, `winrm`, …).
+- `win_events_query` — a bounded historical `Get-WinEvent` query (log + levels + count)
+  over a base64 side-channel so a UTF-16 OEM event message survives; zero matching events
+  and an undecodable payload are reported **differently**, never a silent "0 events".
+  Distinct from the `monitor_*` tools, which report only *new* events after a baseline.
 - PowerShell is invoked via `-EncodedCommand` so it works whatever the remote login
   shell is (Windows OpenSSH often defaults to `cmd.exe`).
 
@@ -198,7 +221,7 @@ pixels.
 
 ```
 src/index.ts            stdio MCP server (stdout is JSON-RPC only; stderr is the log)
-src/tools/registry.ts   the 59 tools + the audited pipeline: zod -> safety gate -> transport
+src/tools/registry.ts   the 63 tools + the audited pipeline: zod -> safety gate -> transport
 src/config/             TOML config: schema (zod, .strict()), loader, secret resolution
 src/transports/ssh.ts       ssh2 exec, persistent shell sessions (in-band sentinel), SFTP streaming
 src/transports/fileops.ts   pure file-management builders/parsers (find+grep, PowerShell, patch) — no transport
@@ -248,13 +271,15 @@ a live session (`Connected=1`) depends on the environment: MsRdpEx's Detours hoo
 attach only inside real client processes, so a plain in-process host may be able to
 create the control and its input window without ever establishing a session. When
 that happens `rdp_connect` says so verbatim with the real last error, and `status`
-keeps saying it. The recorded window handle is real, so `rdp_screenshot` /
-`rdp_click` / `rdp_key` / `rdp_type` act on the local control window; with no live
-session nothing reaches a remote desktop, and `connected=false` is in the same
-result. A real scripted session is normally driven by launching the MsRdpEx-enabled
-client on the target itself. The screen-capture surface for a *connected* session is
-not bound, because with no reachable connected session it would be FFI that fails at
-first use.
+keeps saying it. The `rdp_screenshot` / `rdp_click` / `rdp_key` / `rdp_type` tools act
+on whatever RDP window is open on the control machine (class `AxHostWindow`) — when a
+control window exists its handle is recorded, but with no live session nothing reaches
+a remote desktop, and `connected=false` is in the same result; when no window exists at
+all those tools return `BAD_ARGS`. **A scripted RDP session driven end-to-end by this
+server is not currently implemented:** the intended route is an MsRdpEx-enabled host
+launched on the target itself, which is a TODO, not a shipped path. The screen-capture
+surface for a *connected* session is not bound, because with no reachable connected
+session it would be FFI that fails at first use.
 
 **Measured on the acceptance box (2026-11).** `rdp_connect` there returned
 `connected=false, attempted=true, lastError=DllGetClassObject(CLID
@@ -268,7 +293,10 @@ measured, not assumed — the tool reported the failure verbatim rather than fak
 session. `host_status` still measures the target's real RDP policy over SSH
 (listeners, `LimitBlankPasswordUse`, NLA, a live logon probe) independent of the local
 MsRdpEx control, and reported an accurate "refused — blank password + NLA" verdict on
-a second box.
+a second box. A `prerequisites present` verdict there means only that the target is
+reachable on 3389 with an acceptable policy and a configured credential; it is **not**
+proof this server can open a session — as above that path is not implemented, so
+`host_status` is a network/policy report, never a "RDP works" claim.
 
 **ADB** — `adb` is invoked as argv arrays, never through `cmd.exe`. A missing binary
 is `adb_status → available: false` and `CAPABILITY_UNAVAILABLE` on the operations

@@ -414,7 +414,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
         `host: ${status.hostUp ? 'UP' : 'DOWN'} (${upAddrs.length ? `pinged ${upAddrs.join(', ')}` : 'no interface answered'})\n` +
         `interfaces: ${iface || 'none probed'}\n` +
         sshLine + '\n' +
-        `rdp: ${rd.available ? 'available' : 'refused'} -- ${rd.reason}`,
+        `rdp: ${rd.available ? 'prerequisites present (NOT a verified session)' : 'refused'} -- ${rd.reason}`,
         { status, rdpVerdict: rd, interfacePick: pick },
       );
     },
@@ -1163,7 +1163,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
   // ------------------------------------------------------------------- rdp --
   p.define(
     'rdp_connect',
-    'Create or inspect an MsRdpEx RDP control session for a host (action: connect/disconnect/status); headless connect fails against MsRdpEx on this box, so status honestly reports the real last error and never fakes success.',
+    'Create or inspect an MsRdpEx RDP control for a host (action: connect/disconnect/status). IMPORTANT — this does NOT establish a working session on the control host: the in-process MsRdpEx control cannot reach a live session here (MsRdpEx Detours hooks only attach inside a real mstsc/msrdc process), so connect returns connected=false with the measured HRESULT (e.g. 0x80040111 = control class not registered) and never fakes success. The rdp_screenshot/rdp_click/rdp_key/rdp_type tools act on an ALREADY-OPEN RDP window (class AxHostWindow) — for example one launched with mstsc — and do not create the session themselves.',
     {
       host: z.string().optional(),
       action: z.enum(['connect', 'disconnect', 'status']),
@@ -1173,14 +1173,14 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const st = action === 'connect' ? p.rdp.connect(h) : action === 'disconnect' ? p.rdp.disconnect(h.name) : p.rdp.snapshot(h.name);
       return toolText(
         `rdp ${h.name}: connected=${st.connected} attempted=${st.attempted}${st.lastError ? ' lastError=' + st.lastError : ' (no error recorded)'}`,
-        { state: st, note: st.connected ? 'window handle recorded; rdp_* tools can act on it' : 'MsRdpEx exports no terminate API, so disconnect only clears our state.' },
+        { state: st, note: st.connected ? 'input-window handle recorded; rdp_screenshot/rdp_click/rdp_key/rdp_type can act on it' : 'No live session: this server cannot open a scripted RDP session in-process on this host. To drive a desktop, open an RDP window on the control machine first (e.g. mstsc); then the rdp_* tools act on that window. disconnect only clears our recorded state (MsRdpEx exports no terminate API).' },
       );
     },
   );
 
   p.define(
     'rdp_screenshot',
-    'Capture the RDP window (found by class "AxHostWindow", else the hwnd rdp_connect recorded) to an absolute PNG path via PrintWindow and write it with fs; fails with BAD_ARGS on hosts where rdp_connect never connected or no window is open -- run host_status first.',
+    'Capture an ALREADY-OPEN RDP window (found by class "AxHostWindow", else the hwnd rdp_connect recorded) to an absolute PNG path via PrintWindow and write it with fs. It cannot create a session — on the acceptance box rdp_connect does not connect, so there is usually no window unless one was opened with mstsc; fails with BAD_ARGS when no window exists. Run host_status / rdp_connect status first.',
     {
       host: z.string().optional(),
       outputPath: z.string().min(1).describe('Absolute path for the PNG file'),
@@ -1197,7 +1197,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'rdp_click',
-    'Send mouse-click window messages (WM_*) to the RDP control window, which forwards them to the remote desktop; BAD_ARGS when no window exists for this host.',
+    'Send a mouse-click window message (WM_*) to an ALREADY-OPEN RDP window (class AxHostWindow), which forwards it to the remote desktop. This drives a session that already exists (e.g. opened with mstsc); it does not create one. BAD_ARGS when no window is recorded/open for this host.',
     {
       host: z.string().optional(),
       x: z.number().int().min(0).max(65535),
@@ -1215,7 +1215,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'rdp_key',
-    'Send key window messages to the RDP control window: key is a VK name (ENTER, LEFT, F1, ...) or vk is a number, with optional modifiers for a hotkey; fails BAD_ARGS when no window is found.',
+    'Send a key window message to an ALREADY-OPEN RDP window (class AxHostWindow): key is a VK name (ENTER, LEFT, F1, ...) or vk is a number, with optional modifiers for a hotkey. Drives a session that already exists (e.g. opened with mstsc); it does not create one. Fails BAD_ARGS when no window is recorded/open for this host.',
     {
       host: z.string().optional(),
       key: z.string().optional(),
@@ -1240,7 +1240,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'rdp_type',
-    'Type text into the RDP control window via WM_CHAR window messages (the control forwards them to the remote desktop); BAD_ARGS when no window exists.',
+    'Type text into an ALREADY-OPEN RDP window (class AxHostWindow) via WM_CHAR window messages, which the control forwards to the remote desktop. Drives a session that already exists (e.g. opened with mstsc); it does not create one. BAD_ARGS when no window is recorded/open for this host.',
     {
       host: z.string().optional(),
       text: z.string().min(1),

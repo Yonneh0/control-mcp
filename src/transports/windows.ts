@@ -191,7 +191,11 @@ const USO_ACTION: Record<string, string> = {
   install: 'StartInstall',
 };
 export function updateTriggerCommand(kind: string): string {
-  const verb = USO_ACTION[kind];
+  // Own-property lookup only. `USO_ACTION[kind]` resolves through the prototype
+  // chain, so kind='toString'/'constructor'/'__proto__' came back truthy, passed
+  // the `if (!verb)` allowlist check and reached the command line (`usoclient
+  // toString`, `usoclient [object Object]`, the constructor's source text).
+  const verb = Object.prototype.hasOwnProperty.call(USO_ACTION, kind) ? USO_ACTION[kind] : undefined;
   if (!verb) throw new ControlError('BAD_ARGS', `unknown update action "${kind}"`, { kind, allowed: Object.keys(USO_ACTION) });
   // usoclient verbs are asynchronous: they kick the Update session and return.
   // Success is "triggered", verified separately via updateStatusCommand.
@@ -231,10 +235,19 @@ export function isSelfSeverService(name: string): boolean {
   return SELF_SEVER_SERVICES.includes(name.trim().toLowerCase());
 }
 
-// Status snapshot. StartType is not exposed by Get-Service on Windows PowerShell
-// 5.1, so it is joined from one Get-CimInstance Win32_Service pass (Name→StartType
-// map; Automatic/Manual/Disabled). Status is stringified so the JSON reads
-// "Running"/"Stopped" instead of the 5.1 enum's raw integer.
+// Status snapshot. StartType is joined from one Get-CimInstance Win32_Service
+// pass because Get-Service has no StartType on Windows PowerShell 5.1.
+// The CIM property is StartMode, NOT StartType: Win32_Service has no StartType
+// property at all, so on PS 5.1 `-Property Name,StartType` is not merely empty —
+// it is an INVALID QUERY (HRESULT 0x80041017). Under this builder's
+// SilentlyContinue that error is swallowed, the map stays empty, every row joins
+// null and the tool prints StartType=unknown for services whose start type is
+// perfectly readable. StartMode is the real string property; its value is passed
+// through exactly as CIM reports it ("Auto"/"Manual"/"Disabled", plus "Boot"/
+// "System" for driver services and "Unknown" for a few — all measured live),
+// with no invented mapping onto the Get-Service enum name.
+// Status is stringified because PS 5.1 serializes the ServiceController Status
+// enum as a raw integer (measured: Select Name,Status → {"Name":"W32Time","Status":1}).
 // NOTE on the array guarantee: piping @(...) to ConvertTo-Json does NOT keep a
 // single result array-wrapped (PS3+ unwraps one pipeline item) and an empty
 // pipeline emits nothing, so the builder uses -InputObject plus an explicit '[]'
@@ -248,7 +261,7 @@ export function serviceStatusCommand(name?: string, state?: 'running' | 'stopped
   return psCommand(
     `$ErrorActionPreference='SilentlyContinue'
 $starts = @{}
-Get-CimInstance Win32_Service -Property Name,StartType | ForEach-Object { $starts[$_.Name] = $_.StartType }
+Get-CimInstance Win32_Service -Property Name,StartMode | ForEach-Object { $starts[$_.Name] = $_.StartMode }
 $out = @(Get-Service${nameArg}${stateFilter} | Select-Object Name,DisplayName,@{n='Status';e={$_.Status.ToString()}},@{n='StartType';e={$starts[$_.Name]}})
 if ($out.Count -eq 0) { '[]' } else { ConvertTo-Json -Compress -InputObject $out }`,
   );
@@ -258,17 +271,29 @@ if ($out.Count -eq 0) { '[]' } else { ConvertTo-Json -Compress -InputObject $out
 // the measured Name/DisplayName/Status/StartType JSON. A failed change raises a
 // terminating error ($ErrorActionPreference='Stop') → exit code != 0, which the
 // registry surfaces; the caller still compares the read-back Status. StartType
-// comes from one CIM pass matched in-script (single-quoted name, so no PS
-// string-injection surface beyond needServiceName).
+// comes from one CIM pass (StartMode — see above; the old StartType pass was a
+// terminating Invalid query here, which made the tool report a SUCCESSFUL change
+// as a failure because the read-back aborted).
+//
+// The target is resolved by EXACT name and bound with -InputObject, never by
+// `-Name` on the mutating cmdlet: Get-Service -Name wildcard-matches on PS 5.1
+// (measured: -Name 'W32*' → 1 hit, -Name '[W]32Time' → 1 hit), so a name
+// containing * ? [ ] would let one stop hit services nobody named — including
+// the ssh path via `sshd*`, which the exact-name self-sever guard cannot see.
+// -Name still does the cheap lookup, Where-Object -eq keeps it exact, and the
+// guard runs BEFORE the verb, so "nothing was changed" is provable, not hoped.
 export function serviceChangeCommand(name: string, action: 'start' | 'stop' | 'restart'): string {
   const esc = needServiceName(name);
   const verb = action === 'start' ? 'Start-Service' : action === 'stop' ? 'Stop-Service' : 'Restart-Service';
   return psCommand(
     `$ErrorActionPreference='Stop'
-${verb} -Name '${esc}'
-$svc = Get-Service -Name '${esc}'
-$ci = @(Get-CimInstance Win32_Service -Property Name,StartType | Where-Object { $_.Name -eq '${esc}' })
-[PSCustomObject]@{ Name = $svc.Name; DisplayName = $svc.DisplayName; Status = $svc.Status.ToString(); StartType = $(if ($ci.Count -gt 0) { $ci[0].StartType } else { $null }) } | ConvertTo-Json -Compress`,
+$svc = @(Get-Service -Name '${esc}' | Where-Object { $_.Name -eq '${esc}' })
+if ($svc.Count -ne 1) { Write-Error "win_service: the ${action} target did not resolve to exactly one service by exact name (matched $($svc.Count)) - nothing was changed" }
+${verb} -InputObject $svc[0]
+$rb = @(Get-Service -Name '${esc}' | Where-Object { $_.Name -eq '${esc}' })
+if ($rb.Count -ne 1) { Write-Error "win_service: ${action} ran but the service is not readable afterwards (matched $($rb.Count)) - read-back unverified" }
+$ci = @(Get-CimInstance Win32_Service -Property Name,StartMode | Where-Object { $_.Name -eq '${esc}' })
+[PSCustomObject]@{ Name = $rb[0].Name; DisplayName = $rb[0].DisplayName; Status = $rb[0].Status.ToString(); StartType = $(if ($ci.Count -gt 0) { $ci[0].StartMode } else { $null }) } | ConvertTo-Json -Compress`,
   );
 }
 

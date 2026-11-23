@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, posix, win32 } from 'node:path';
 import { ControlError } from '../errors.js';
 import { resolveAdbBin, type AdbBinResolution } from './adbPath.js';
 
@@ -48,12 +48,37 @@ interface SpawnOut {
 }
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47];
-const INPUT_SAFE = /^(?!-)[A-Za-z0-9 ._-]+$/; // no leading '-': `input text -h` would be parsed as an option
+// The device `input text` argument: only these characters can ever reach it,
+// spaces are encoded as %s, and a leading '-' is refused (`input text -h` would
+// be parsed as an option). Because spaces never survive the %s encoding, no
+// option-like fragment (`--help`) and no shell metacharacter can become a
+// separate word — anything outside this class is refused outright rather than
+// quoted, so a payload like `'; rm -rf /sdcard` can neither inject nor type.
+const INPUT_SAFE = /^(?!-)[A-Za-z0-9 ._-]+$/;
 // Caps on captured child output; dropping a chunk past a cap sets `truncated`.
 const STDOUT_CAP = 8 * 1024 * 1024;
 const STDERR_CAP = 1 * 1024 * 1024;
 // Grace after SIGTERM before escalating to SIGKILL and settling anyway.
 const KILL_GRACE_MS = 1000;
+
+// ---------------------------------------------------------------------------
+// Device-side quoting.
+//
+// spawnAdb/spawnWait take an argv ARRAY, so nothing here ever passes through
+// the HOST shell (cmd.exe / sh): host-side injection is not possible. The
+// injection surface is the DEVICE — `adb -s X shell <cmd>` hands <cmd> verbatim
+// to the device's /system/bin/sh, which word-splits and expands it. So every
+// caller-supplied string that lands inside one <cmd> must be quoted FOR THAT
+// SHELL, and the quoting must never be hand-rolled at the call site.
+//
+// quoteShellArg is the single form used for that. Single quotes are the only
+// POSIX form in which every other character ($ ` \ ; & | < > ( ) newline *) is
+// literal. A single quote cannot appear inside single quotes, so it is spelled
+// out as '\'': close quote, escaped quote, reopen quote.
+// ---------------------------------------------------------------------------
+export function quoteShellArg(value: string): string {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
 
 // Resolved adb binary, cached after the first probe so we do not re-stat the
 // SDK on every call. Call sites pass the sentinel 'adb' as argv[0]; the two
@@ -306,8 +331,11 @@ function needCoordinates(name: string, values: number[]): void {
 }
 
 function needDuration(durationMs: number): void {
-  if (!Number.isSafeInteger(durationMs) || durationMs < 1) {
-    throw new ControlError('BAD_ARGS', 'invalid swipe duration', { durationMs });
+  // Mirror the public adb_swipe schema bound (1..60000). An unbounded value is
+  // not a typo we can honour: the device keeps swiping long after the local adb
+  // client has been killed at timeoutMs, so the refusal belongs here.
+  if (!Number.isSafeInteger(durationMs) || durationMs < 1 || durationMs > 60000) {
+    throw new ControlError('BAD_ARGS', `invalid swipe duration: ${durationMs} is outside the allowed range 1..60000`, { durationMs });
   }
 }
 
@@ -350,6 +378,7 @@ export async function inputText(serial: string, text: string, timeoutMs = 15000)
       'BAD_ARGS',
       'input text must stay within [A-Za-z0-9 ._-]; control characters are refused',
       { text },
+      'special characters cannot be typed by `input text` safely: send them with adb_key (e.g. delete, tab) or omit them',
     );
   }
   await runInput(serial, `input text ${text.replace(/ /g, '%s')}`, 'input text', timeoutMs);
@@ -568,8 +597,15 @@ const KEY_CODES: Record<string, number> = {
 };
 
 export function resolveKeyCode(name: string): number | null {
+  // A non-string (a JSON body with the wrong shape, a null) is not a key name:
+  // answer null so the caller reports "unknown key" with the list of known keys
+  // instead of taking down the call with a TypeError on .trim().
+  if (typeof name !== 'string') return null;
   const lower = name.trim().toLowerCase();
-  if (KEY_CODES[lower] !== undefined) return KEY_CODES[lower];
+  // Own-property lookup only: KEY_CODES is an object literal, so an inherited
+  // name ('toString', 'constructor', 'valueOf') would otherwise be returned as
+  // the key CODE — a function, not a number — instead of answered with null.
+  if (Object.prototype.hasOwnProperty.call(KEY_CODES, lower)) return KEY_CODES[lower];
   if (/^\d+$/.test(lower)) return parseInt(lower, 10);
   return null;
 }
@@ -609,6 +645,7 @@ export async function setTextField(
       'BAD_ARGS',
       'field text must stay within [A-Za-z0-9 ._-]; use adb_key for special characters',
       { text },
+      'characters outside [A-Za-z0-9 ._-] cannot be typed into the field: use adb_key for them or strip them from the value',
     );
   }
   await inputTap(serial, node.centerX, node.centerY, timeoutMs);
@@ -660,11 +697,30 @@ export async function launchApp(serial: string, pkg: string, timeoutMs = 15000):
 // rogue MIME registration cannot swallow the link.
 export async function openUrl(serial: string, url: string, browserPackage?: string, timeoutMs = 15000): Promise<{ ok: boolean; command: string; output: string }> {
   serial = needSerial(serial);
-  if (url.includes("'")) throw new ControlError('BAD_ARGS', 'url must not contain a single quote', {});
+  if (typeof url !== 'string') {
+    throw new ControlError('BAD_ARGS', 'url must be a string', { received: typeof url });
+  }
+  // A URL lands inside the device command as ONE quoted word, so a single quote
+  // would end the quoting form. It is refused rather than escaped: a URL that
+  // contains a single quote is never what the operator meant to open.
+  if (url.includes("'")) throw new ControlError('BAD_ARGS', 'url must not contain a single quote', { url: url.slice(0, 60) });
+  // Whitespace and control bytes are not valid URL bytes: they cannot be
+  // percent-decoding (an encoded space is %20) and would reach `am` as literal
+  // data in the intent URI, so they are refused here rather than quoted around.
+  if (/[\s\x00-\x1f\x7f]/.test(url)) {
+    throw new ControlError(
+      'BAD_ARGS',
+      'url must not contain whitespace or control characters',
+      { url: url.slice(0, 60) },
+      'percent-encode a space as %20 and strip control characters — a raw newline or space is not part of a URL',
+    );
+  }
   if (!/^https?:\/\//i.test(url)) {
     throw new ControlError('BAD_ARGS', 'only http(s) URLs are accepted by adb_open_url', { url: url.slice(0, 60) });
   }
-  let cmd = `am start -a android.intent.action.VIEW -d '${url}'`;
+  // Quoted for the DEVICE shell: & ? = # $ ( ) ` | are data here, not syntax.
+  // quoteShellArg keeps the whole URL a single word on the device's `am`.
+  let cmd = `am start -a android.intent.action.VIEW -d ${quoteShellArg(url)}`;
   if (browserPackage) cmd += ` -p ${needPackage(browserPackage)}`;
   const r = await adbExec(serial, cmd, timeoutMs);
   const output = (r.stdout + '\n' + r.stderr).trim();
@@ -709,13 +765,46 @@ function needRemotePath(p: string, label: string): string {
   return t;
 }
 
+// A local path is written by the adb child (pull) or read from (push), so a
+// RELATIVE one resolves against the server's own working directory — landing
+// outside whatever the operator meant, with no allowlist to catch it. Absolute
+// is the only meaningful guard, and it has to hold inside the transport, not
+// only at one tool boundary. Both path dialects are accepted because the two
+// disagree on their own host: win32.isAbsolute('/srv/x') is true while
+// posix.isAbsolute('C:\\x') is false. This rejects relative paths only; it
+// never claims a path is writable, readable, or safe beyond that.
+export function isAbsoluteLocalPath(p: string): boolean {
+  if (typeof p !== 'string' || p.trim() === '') return false;
+  const t = p.trim();
+  return win32.isAbsolute(t) || posix.isAbsolute(t);
+}
+
+function needLocalPath(p: string, label: string): string {
+  if (typeof p !== 'string' || p.trim() === '') {
+    throw new ControlError('BAD_ARGS', `${label} must be a non-empty absolute path`, {});
+  }
+  const t = p.trim();
+  if (!isAbsoluteLocalPath(t)) {
+    throw new ControlError(
+      'BAD_ARGS',
+      `${label} must be an absolute local path: "${t}" would resolve against the server's working directory`,
+      { [label]: t },
+      `pass a full path for ${label} (e.g. C:\\out\\shot.png or /tmp/shot.png)`,
+    );
+  }
+  return t;
+}
+
 export async function listDir(serial: string, remotePath: string, timeoutMs = 15000): Promise<FileEntry[]> {
   serial = needSerial(serial);
   const rp = needRemotePath(remotePath, 'remotePath');
-  const r = await adbExec(serial, `ls -l '${rp.replace(/'/g, "'\\''")}'`, timeoutMs);
+  // One quoting form for every caller path: a device path may legitimately
+  // contain spaces, and must not be able to end its own quote.
+  const q = quoteShellArg(rp);
+  const r = await adbExec(serial, `ls -l ${q}`, timeoutMs);
   if (r.code !== 0 || /No such file|Permission denied|Is a directory/.test(r.stdout + r.stderr)) {
     // Fall back to treating a single path as a file.
-    const single = await adbExec(serial, `ls -ld '${rp.replace(/'/g, "'\\''")}'`, timeoutMs);
+    const single = await adbExec(serial, `ls -ld ${q}`, timeoutMs);
     if (single.code !== 0) {
       throw new ControlError('REMOTE_ERROR', `ls ${rp} failed: ${(r.stderr || single.stderr || r.stdout).trim().slice(0, 200)}`, { serial, remotePath: rp });
     }
@@ -767,29 +856,32 @@ function spawnWait(argv: string[], timeoutMs: number): Promise<{ code: number | 
 export async function pullFile(serial: string, remotePath: string, localPath: string, timeoutMs = 60000): Promise<{ bytes: number; localPath: string }> {
   serial = needSerial(serial);
   const rp = needRemotePath(remotePath, 'remotePath');
-  if (!localPath || localPath.trim() === '') throw new ControlError('BAD_ARGS', 'localPath must be a non-empty absolute path', {});
-  mkdirSync(dirname(localPath), { recursive: true });
-  const res = await spawnWait(['adb', '-s', serial, 'pull', rp, localPath], timeoutMs);
+  // Validated before mkdir/spawn so a bad destination never creates a directory
+  // nor moves bytes.
+  const lp = needLocalPath(localPath, 'localPath');
+  mkdirSync(dirname(lp), { recursive: true });
+  const res = await spawnWait(['adb', '-s', serial, 'pull', rp, lp], timeoutMs);
   if (res.code !== 0 || res.timedOut) {
     throw new ControlError(res.timedOut ? 'TIMEOUT' : 'REMOTE_ERROR', `pull ${rp} failed: ${res.stderr.trim().slice(0, 200) || 'adb pull exit ' + res.code}`, { serial, remotePath: rp });
   }
-  if (!existsSync(localPath)) throw new ControlError('REMOTE_ERROR', `pull reported success but ${localPath} is absent`, { serial, localPath });
+  if (!existsSync(lp)) throw new ControlError('REMOTE_ERROR', `pull reported success but ${lp} is absent`, { serial, localPath: lp });
   // adb pull of a directory lands a directory; stat of that is meaningless as a
   // "bytes pulled" figure, so only a regular file counts as success here.
-  const st = statSync(localPath);
-  if (!st.isFile()) throw new ControlError('REMOTE_ERROR', `pull reported success but ${localPath} is not a regular file (a directory pull lands a directory)`, { serial, localPath });
-  return { bytes: st.size, localPath };
+  const st = statSync(lp);
+  if (!st.isFile()) throw new ControlError('REMOTE_ERROR', `pull reported success but ${lp} is not a regular file (a directory pull lands a directory)`, { serial, localPath: lp });
+  return { bytes: st.size, localPath: lp };
 }
 
 export async function pushFile(serial: string, localPath: string, remotePath: string, timeoutMs = 60000): Promise<{ bytes: number }> {
   serial = needSerial(serial);
   const rp = needRemotePath(remotePath, 'remotePath');
-  if (!existsSync(localPath)) throw new ControlError('BAD_ARGS', `local file does not exist: ${localPath}`, { localPath });
-  const res = await spawnWait(['adb', '-s', serial, 'push', localPath, rp], timeoutMs);
+  const lp = needLocalPath(localPath, 'localPath');
+  if (!existsSync(lp)) throw new ControlError('BAD_ARGS', `local file does not exist: ${lp}`, { localPath: lp });
+  const res = await spawnWait(['adb', '-s', serial, 'push', lp, rp], timeoutMs);
   if (res.code !== 0 || res.timedOut) {
     throw new ControlError(res.timedOut ? 'TIMEOUT' : 'REMOTE_ERROR', `push -> ${rp} failed: ${res.stderr.trim().slice(0, 200) || 'adb push exit ' + res.code}`, { serial, remotePath: rp });
   }
-  return { bytes: statSync(localPath).size };
+  return { bytes: statSync(lp).size };
 }
 
 // ---- app inventory -------------------------------------------------------
@@ -810,6 +902,21 @@ export async function listApps(serial: string, scope: AppsScope = 'all', timeout
 // ---- settings ------------------------------------------------------------
 
 export type SettingsNs = 'system' | 'secure' | 'global';
+
+// The namespace is interpolated into the device command unquoted (it is a fixed
+// word of `settings <verb> <ns> ...`), so the type has to be enforced at runtime
+// too: TypeScript's SettingsNs is erased at the boundary, and any caller that
+// is not the zod-validated tool (another module, a test, a future wiring) could
+// otherwise put `global; rm -rf /sdcard` in that slot and have the DEVICE shell
+// run it.
+function needNs(ns: SettingsNs): SettingsNs {
+  const t = typeof ns === 'string' ? ns.trim() : '';
+  if (t !== 'system' && t !== 'secure' && t !== 'global') {
+    throw new ControlError('BAD_ARGS', `invalid settings namespace: ${JSON.stringify(ns)} (allowed system|secure|global)`, { ns: t }, 'namespace must be exactly system, secure or global');
+  }
+  return t as SettingsNs;
+}
+
 function needKey(key: string): string {
   const t = key.trim();
   if (!/^[A-Za-z0-9_.:]+$/.test(t)) throw new ControlError('BAD_ARGS', `invalid settings key: "${t}"`, { key: t });
@@ -818,20 +925,23 @@ function needKey(key: string): string {
 
 export async function getSetting(serial: string, ns: SettingsNs, key: string, timeoutMs = 15000): Promise<string | null> {
   serial = needSerial(serial);
-  const r = await adbExec(serial, `settings get ${ns} ${needKey(key)}`, timeoutMs);
+  const n = needNs(ns);
+  const r = await adbExec(serial, `settings get ${n} ${needKey(key)}`, timeoutMs);
   const v = r.stdout.trim();
-  if (r.code !== 0) throw new ControlError('REMOTE_ERROR', `settings get failed: ${r.stderr.trim().slice(0, 200)}`, { serial, ns, key });
+  if (r.code !== 0) throw new ControlError('REMOTE_ERROR', `settings get failed: ${r.stderr.trim().slice(0, 200)}`, { serial, ns: n, key });
   return v === '' || v === 'null' ? null : v;
 }
 
 export async function putSetting(serial: string, ns: SettingsNs, key: string, value: string, timeoutMs = 15000): Promise<{ written: string; readBack: string | null }> {
   serial = needSerial(serial);
+  const n = needNs(ns);
   const k = needKey(key);
-  const quoted = `'${String(value).replace(/'/g, "'\\''")}'`;
-  const r = await adbExec(serial, `settings put ${ns} ${k} ${quoted}`, timeoutMs);
-  if (r.code !== 0) throw new ControlError('REMOTE_ERROR', `settings put failed: ${r.stderr.trim().slice(0, 200)}`, { serial, ns, key: k });
+  // The value is arbitrary operator text: quote it for the device shell so
+  // quotes, $( ), ; and newlines are written as data, then read the truth back.
+  const r = await adbExec(serial, `settings put ${n} ${k} ${quoteShellArg(String(value))}`, timeoutMs);
+  if (r.code !== 0) throw new ControlError('REMOTE_ERROR', `settings put failed: ${r.stderr.trim().slice(0, 200)}`, { serial, ns: n, key: k });
   // Read back the truth rather than trusting the write exit code.
-  const readBack = await getSetting(serial, ns, k, timeoutMs);
+  const readBack = await getSetting(serial, n, k, timeoutMs);
   return { written: String(value), readBack };
 }
 
@@ -943,6 +1053,9 @@ export async function recordScreen(
     throw new ControlError('BAD_ARGS', 'bitRateMbps must be 1..60', { bitRateMbps });
   }
   const seconds = Math.max(1, Math.round(durationMs / 1000));
+  // Validate the local destination BEFORE any device work: a relative path must
+  // not cost a screenrecord run whose result then has nowhere honest to go.
+  const lp = needLocalPath(localPath, 'localPath');
   const remote = `/sdcard/dsh_rec_${process.pid}_${dumpNonce++}.mp4`;
   // Android's screenrecord wants a plain integer for --time-limit (seconds) and
   // bits-per-second for --bit-rate; the `s`/`M` suffixes are rejected by the
@@ -957,12 +1070,12 @@ export async function recordScreen(
     if (r.code === null) throw new ControlError('REMOTE_ERROR', 'screenrecord produced no exit code (process killed or timed out); the clip may be truncated', { serial, seconds });
     throw new ControlError('REMOTE_ERROR', `screenrecord failed: ${(r.stderr || r.stdout).trim().slice(0, 200) || 'exit ' + r.code}`, { serial, seconds });
   }
-  const pulled = await pullFile(serial, remote, localPath, timeoutMs);
+  const pulled = await pullFile(serial, remote, lp, timeoutMs);
   await adbExec(serial, `rm -f ${remote}`, 10000).catch(() => undefined);
   if (pulled.bytes === 0) {
     throw new ControlError('REMOTE_ERROR', 'screenrecord produced an empty clip', { serial });
   }
-  return { bytes: pulled.bytes, localPath, durationMs: seconds * 1000, note: 'silent video (screenrecord does not capture audio on Android); for live streaming use a dedicated scrcpy bridge' };
+  return { bytes: pulled.bytes, localPath: lp, durationMs: seconds * 1000, note: 'silent video (screenrecord does not capture audio on Android); for live streaming use a dedicated scrcpy bridge' };
 }
 
 // ---- UI presets ----------------------------------------------------------
@@ -1036,6 +1149,13 @@ export async function runUiPreset(serial: string, name: UiPreset, timeoutMs = 20
         detail: flipped ? 'tapped switch-to-front' : 'no front-switch control found (camera may already be front or still loading)',
         observed: nowFront ? 'front camera active' : 'could not confirm front camera from hierarchy',
       };
+    }
+    default: {
+      // The switch is exhaustive over UiPreset today, so a value reaching here
+      // came from outside the enum. Falling off the end would resolve the call
+      // to `undefined` (which the tool then dereferences as r.ok); refuse it
+      // with the list of what is actually supported instead.
+      throw new ControlError('BAD_ARGS', `unknown UI preset: ${JSON.stringify(name)}`, { preset: name }, `known presets: ${UI_PRESETS.join(', ')}`);
     }
   }
 }

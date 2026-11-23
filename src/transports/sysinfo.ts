@@ -14,7 +14,9 @@ import { psCommand } from './windows.js';
 // null that came from missing/partial data gets a matching note in `warnings`.
 // In particular Linux memUsedMb is NOT reconstructed from MemFree+Buffers+Cached
 // when MemAvailable is absent (old kernels), and Windows cpuPct per process is
-// null because the cheap snapshot does not measure it.
+// null because the cheap snapshot does not measure it. A pair of counters that
+// contradicts itself (free > total, or a negative size) is stated as a warning
+// with nulls — never a negative "used", never clamped to a plausible figure.
 //
 // Units: memory is MB as DECIMAL megabytes (10^6 bytes), converted from the
 // source unit of each field — /proc/meminfo is kB (1024 bytes), df -P is
@@ -273,8 +275,12 @@ export function parseLinuxMetrics(stdout: string): HostMetrics {
     else m.memTotalMb = kbToMb(total);
 
     const avail = kb.get('MemAvailable');
-    if (avail !== undefined && total !== undefined) m.memUsedMb = kbToMb(total - avail);
-    else if (avail === undefined)
+    if (avail !== undefined && total !== undefined) {
+      // MemAvailable above MemTotal happens under some cgroup/container
+      // reporting; the difference would be a negative "used", not a measurement.
+      if (avail > total) w.push('MemAvailable exceeds MemTotal — memUsedMb not computed (inconsistent counters)');
+      else m.memUsedMb = kbToMb(total - avail);
+    } else if (avail === undefined)
       w.push('MemAvailable absent in /proc/meminfo — memUsedMb not computed (pre-3.14 kernel; NOT guessed from MemFree+Buffers+Cached)');
     else w.push('MemAvailable present but MemTotal absent — memUsedMb not computed');
 
@@ -282,8 +288,10 @@ export function parseLinuxMetrics(stdout: string): HostMetrics {
     if (swapTotal === undefined) w.push('SwapTotal absent — swap not measured');
     else m.swapTotalMb = kbToMb(swapTotal);
     const swapFree = kb.get('SwapFree');
-    if (swapTotal !== undefined && swapFree !== undefined) m.swapUsedMb = kbToMb(swapTotal - swapFree);
-    else if (swapTotal !== undefined) w.push('SwapFree absent — swapUsedMb not computed');
+    if (swapTotal !== undefined && swapFree !== undefined) {
+      if (swapFree > swapTotal) w.push('SwapFree exceeds SwapTotal — swapUsedMb not computed (inconsistent counters)');
+      else m.swapUsedMb = kbToMb(swapTotal - swapFree);
+    } else if (swapTotal !== undefined) w.push('SwapFree absent — swapUsedMb not computed');
   }
 
   // disks: df -P, columns Filesystem 1024-blocks Used Available Capacity on --
@@ -343,6 +351,12 @@ export function parseLinuxMetrics(stdout: string): HostMetrics {
         continue;
       }
       const tail = t.slice(-3);
+      // Some ps builds ignore the `comm=` header suppression and print
+      // "COMMAND PID %MEM %CPU"; unguarded it becomes a bogus process named
+      // COMMAND with all-null fields. Recognized by a header word in the name
+      // position AND a non-numeric pid position, so a real process actually
+      // named COMMAND (which has a numeric pid) is still kept.
+      if (/^(COMMAND|CMD|PID|PROCESS)$/i.test(t[0]) && !/^\d+$/.test(tail[0])) continue;
       const name = t.slice(0, -3).join(' ');
       if (!name) {
         w.push(`ps row skipped (no command name): ${line}`);
@@ -364,16 +378,25 @@ export function parseLinuxMetrics(stdout: string): HostMetrics {
   return m;
 }
 
-// A .NET date as milliseconds since the epoch.
-// Windows PowerShell 5.1's ConvertTo-Json writes a DateTime as
-// "/Date(1763620800000+0000)/" — the number is already UTC ms and the ±HHmm
-// suffix is only the sender's display offset, so the suffix is ignored (applying
-// it to one side of a difference and not the other would shift the result).
-// PowerShell 7 writes ISO-8601. Anything else yields null, so uptime is not
-// measured rather than invented.
-function parseDotNetDateMs(v: unknown): number | null {
+// A .NET date as milliseconds since the epoch. Every form a ConvertTo-Json
+// payload has actually been observed in is accepted; anything else yields null,
+// so uptime is not measured rather than invented.
+//
+// Windows PowerShell 5.1 writes a [DateTime] in one of two shapes depending on
+// where it came from (both live-measured):
+//   bare string  "\/Date(1795362141500)\/"                       — a CIM property (host X1)
+//   object       {"value":"\/Date(1795434601250)\/","DateTime":"Monday, November 23, 2026 11:50:01 AM"}
+//                — (Get-Date) as a property (hosts n100 and X1; X1 adds a
+//                DisplayHint member, and n100 sent LastBootUpTime this way too)
+// After JSON.parse the `\/` escape is just `/`. The ms figure is already UTC
+// since the epoch and the ±HHmm suffix is only the sender's display offset, so
+// the suffix is ignored — applying it to one side of a difference and not the
+// other would shift the result. The sibling "DateTime" member is a locale
+// display string with NO timezone, so it is never parsed: guessing from it
+// could shift uptime by hours. PowerShell 7 writes ISO-8601 strings; a bare
+// number is epoch ms.
+function dotNetDateMsFromScalar(v: string | number): number | null {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  if (typeof v !== 'string') return null;
   const s = v.trim();
   const m = /^\/?Date\((-?\d+)(?:[+-]\d{4})?\)\/?$/.exec(s);
   if (m) {
@@ -382,6 +405,27 @@ function parseDotNetDateMs(v: unknown): number | null {
   }
   const t = Date.parse(s);
   return Number.isNaN(t) ? null : t;
+}
+
+function parseDotNetDateMs(v: unknown): number | null {
+  if (typeof v === 'string' || typeof v === 'number') return dotNetDateMsFromScalar(v);
+  if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+    const inner = (v as Record<string, unknown>).value;
+    if (typeof inner === 'string' || typeof inner === 'number') return dotNetDateMsFromScalar(inner);
+  }
+  return null;
+}
+
+// Rows of a ConvertTo-Json section, accepting object OR array. PowerShell keeps
+// `@( … )` as an array even for one row (live-verified on 5.1.26100), but the
+// same query without the wrapper — and any producer that collapses a
+// single-element collection — delivers a bare object instead of [ {...} ]. One
+// real disk/process must be parsed, not reported as "returned nothing"; a
+// string or number is NOT arrayified (that is a truncated section, not a row).
+function asRows(v: unknown): unknown[] | null {
+  if (Array.isArray(v)) return v;
+  if (v !== null && typeof v === 'object') return [v];
+  return null;
 }
 
 export function parseWindowsMetrics(json: unknown, collectedAt?: string): HostMetrics {
@@ -413,14 +457,20 @@ export function parseWindowsMetrics(json: unknown, collectedAt?: string): HostMe
     if (totalVis === null) w.push('TotalVisibleMemorySize absent — memTotalMb not measured');
     else m.memTotalMb = kbToMb(totalVis);
 
-    if (totalVis !== null && freePhys !== null) m.memUsedMb = kbToMb(totalVis - freePhys);
-    else if (totalVis !== null) w.push('FreePhysicalMemory absent — memUsedMb not computed');
+    if (totalVis !== null && freePhys !== null) {
+      // Free memory larger than total memory is a counter inconsistency; the
+      // difference would be a negative "used", which is not a measurement.
+      if (freePhys > totalVis) w.push('FreePhysicalMemory exceeds TotalVisibleMemorySize — memUsedMb not computed');
+      else m.memUsedMb = kbToMb(totalVis - freePhys);
+    } else if (totalVis !== null) w.push('FreePhysicalMemory absent — memUsedMb not computed');
 
     if (totalVirt === null) w.push('TotalVirtualMemorySize absent — swapTotalMb not measured');
     else m.swapTotalMb = kbToMb(totalVirt);
 
-    if (totalVirt !== null && freeVirt !== null) m.swapUsedMb = kbToMb(totalVirt - freeVirt);
-    else if (totalVirt !== null) w.push('FreeVirtualMemory absent — swapUsedMb not computed');
+    if (totalVirt !== null && freeVirt !== null) {
+      if (freeVirt > totalVirt) w.push('FreeVirtualMemory exceeds TotalVirtualMemorySize — swapUsedMb not computed');
+      else m.swapUsedMb = kbToMb(totalVirt - freeVirt);
+    } else if (totalVirt !== null) w.push('FreeVirtualMemory absent — swapUsedMb not computed');
 
     const bootMs = parseDotNetDateMs(osObj.LastBootUpTime);
     const nowMs = parseDotNetDateMs(o.Now);
@@ -430,8 +480,8 @@ export function parseWindowsMetrics(json: unknown, collectedAt?: string): HostMe
   }
 
   // Win32_LogicalDisk DriveType=3 rows: Size/FreeSpace in BYTES.
-  const diskRows = Array.isArray(o.Disks) ? o.Disks : null;
-  if (diskRows === null) w.push('no disk rows (Win32_LogicalDisk returned nothing)');
+  const diskRows = asRows(o.Disks);
+  if (diskRows === null || diskRows.length === 0) w.push('no disk rows (Win32_LogicalDisk returned nothing)');
   for (const raw of diskRows ?? []) {
     if (raw === null || typeof raw !== 'object') {
       w.push('disk row is not an object, skipped');
@@ -447,22 +497,29 @@ export function parseWindowsMetrics(json: unknown, collectedAt?: string): HostMe
     const free = num(d.FreeSpace);
     if (size === null) w.push(`disk ${mount}: Size absent — sizes not measured`);
     if (free === null) w.push(`disk ${mount}: FreeSpace absent — used/free not measured`);
+    // A negative counter, or one that leaves nothing for "used" (FreeSpace >
+    // Size), is a corrupted CIM read, not a measurement: bytesToMb of the
+    // difference would report an impossible negative disk. The row is kept
+    // (its DeviceID and any sane figure were measured) with null replacing the
+    // impossible ones, and the inconsistency stated.
+    const inverted = size !== null && free !== null && (size < 0 || free < 0 || free > size);
+    if (inverted) w.push(`disk ${mount}: inconsistent Size/FreeSpace (Size=${size}, FreeSpace=${free}) — used/usedPct not measured`);
     m.disks.push({
       mount,
       filesystem: null, // DriveType=3 rows carry no volume label/filesystem here
-      totalMb: size === null ? null : bytesToMb(size),
-      usedMb: size === null || free === null ? null : bytesToMb(size - free),
-      freeMb: free === null ? null : bytesToMb(free),
+      totalMb: size === null || size < 0 ? null : bytesToMb(size),
+      usedMb: size === null || free === null || inverted ? null : bytesToMb(size - free),
+      freeMb: free === null || free < 0 ? null : bytesToMb(free),
       // Size=0 (a media-less removable drive) makes the ratio meaningless.
-      usedPct: size === null || free === null || size <= 0 ? null : Math.round(((size - free) / size) * 100),
+      usedPct: size === null || free === null || inverted || size <= 0 ? null : Math.round(((size - free) / size) * 100),
     });
   }
 
   // Get-Process rows: WS is bytes; per-process CPU% is not in this snapshot,
   // so cpuPct is null for every row (a one-shot CPU read needs a second sample
   // window — that is a capability gap, stated here rather than faked).
-  const topRows = Array.isArray(o.Top) ? o.Top : null;
-  if (topRows === null) w.push('no process rows (Get-Process returned nothing)');
+  const topRows = asRows(o.Top);
+  if (topRows === null || topRows.length === 0) w.push('no process rows (Get-Process returned nothing)');
   for (const raw of topRows ?? []) {
     if (raw === null || typeof raw !== 'object') {
       w.push('process row is not an object, skipped');
