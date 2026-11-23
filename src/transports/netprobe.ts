@@ -70,68 +70,86 @@ export function probeTcp(address: string, port: number, timeoutMs = 2000): Promi
   });
 }
 
-async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTransport): Promise<{ blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string }> {
-  const out: { blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string } = {};
-  // UserAuthentication is the NLA switch (1 = require NLA); SecurityLayer is a
-  // different value and would misreport. The blank-password probe targets the
-  // account RDP would actually use: rdp.user when configured, otherwise it is
-  // NOT meaningful for ssh-only accounts (a wrong non-blank password also fails)
-  // — so without an rdp block we skip the probe entirely. Measured on this LAN
-  // (2026-11-22): `cmd /c "net use \\<ip>\IPC$ \"\" /user:<blank-acct>"` against
-  // n100 User returns exit 2 with stderr "System error 1326 ... user name or
-  // password is incorrect" — on this Server SKU that is what blank rejection
-  // under LimitBlankPasswordUse=1 looks like; client SKUs show the classic 1327
-  // ("blank passwords aren't allowed"). Nonzero exit with lbp=1 = refused;
-  // exit 0 would mean blank network logon IS allowed (probe established a
-  // session, which we immediately clean up).
-  const probeUser = host.rdp?.user;
-  // Run net use through cmd /c with NO inner quotes around the empty password:
-  // measured on this LAN 2026-11-22 — `cmd /c net use \\<ip>\IPC$ "" /user:<acct>`
-  // against n100's blank User returns exit 2 + "System error 1327 ... blank
-  // passwords aren't allowed" (the documented proof). Any inner quote layer
-  // mangles the empty argument into 1326/usage errors. EncodedCommand base64
-  // carries the "" token intact through ssh -> powershell -> cmd.
+// An address or user reaching the net-use probe below comes from config, which
+// the schema validates only as min(1) (no character set). These values are
+// interpolated into a PowerShell string and a UNC path; a wrong or generated
+// value carrying ` $ ` ' " ; | & ( ) space \ or a control byte could expand
+// inside the double-quoted `cmd /c` argument or make the credential RegExp throw.
+// The builder fails safe toward refusal rather than trusting the operator.
+const RDP_PROBE_ADDRESS_UNSAFE = /[ `'";|&()$\\\r\n\0]/;
+// A Windows account may be domain-qualified (`DOMAIN\acct`); the backslash is
+// kept but every shell/PS metacharacter is refused.
+const RDP_PROBE_USER_UNSAFE = /[ `'";|&()$\r\n\0]/;
+
+// Pure command builder for the blank-password / NLA / LimitBlankPasswordUse
+// probe, split out so the interpolation is unit-testable with no host. The
+// `""` empty-password token must reach `cmd` intact — measured on this LAN that
+// the 1327 "blank passwords aren't allowed" proof (vs 1326 for a wrong non-blank
+// password) appears only with no inner quote layer around it; UTF-16LE base64
+// carries it through ssh -> powershell -> cmd.
+export function rdpPolicyCommand(address: string, user: string): string {
+  if (RDP_PROBE_ADDRESS_UNSAFE.test(address)) {
+    throw new ControlError('BAD_ARGS', `refusing RDP policy probe: unsafe characters in host address ${JSON.stringify(address)}`, { address }, 'host addresses must contain only letters, digits, dots, dashes and underscores');
+  }
+  if (RDP_PROBE_USER_UNSAFE.test(user)) {
+    throw new ControlError('BAD_ARGS', `refusing RDP policy probe: unsafe characters in RDP user ${JSON.stringify(user)}`, { user }, 'the RDP user must not contain quotes, $, backtick, space or shell metacharacters');
+  }
   const ps = [
     `$ErrorActionPreference='SilentlyContinue'`,
     `$ProgressPreference='SilentlyContinue'`,
     `$lbp=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa').LimitBlankPasswordUse`,
     `$nla=(Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp').UserAuthentication`,
-    `$o = cmd /c net use \\\\${address}\\IPC$ "" /user:${probeUser} 2>&1`,
+    `$o = cmd /c net use \\\\${address}\\IPC$ "" /user:${user} 2>&1`,
     `$code=$LASTEXITCODE`,
     `net use \\\\${address}\\IPC$ /delete 2>&1 | Out-Null`,
     `$m = ($o | Out-String)`,
     `$ec=''; if($m -match 'System error (\\d+)'){$ec=$Matches[1]}`,
     `Write-Output "lbp=$lbp nla=$nla netuse=$code err=$ec"`,
   ].join('; ');
-  const b64 = Buffer.from(ps, 'utf16le').toString('base64');
+  return Buffer.from(ps, 'utf16le').toString('base64');
+}
+
+// Pure parser for the probe's `lbp=.. nla=.. netuse=.. err=..` line.
+// blankPasswordAccount is set ONLY by the error number, never the exit code:
+// a wrong NON-blank password also exits 2 (1326), so exit code alone lies.
+export function parseRdpPolicyLine(line: string): { blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string } {
+  const out: { blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string } = {};
+  const lbp = /lbp=(\d+)/.exec(line);
+  const nla = /nla=(\d+)/.exec(line);
+  const nu = /netuse=(-?\d+)/.exec(line);
+  const ec = /err=(\d+)/.exec(line);
+  if (lbp) out.limitBlankPasswordUse = Number(lbp[1]);
+  if (nla) out.nlaRequired = nla[1] === '1';
+  if (nu) out.netuseCode = nu[1];
+  if (ec) out.netuseErr = ec[1];
+  if (ec && ec[1] === '1327') out.blankPasswordAccount = true;
+  else if (ec) out.blankPasswordAccount = false;
+  else if (nu && nu[1] === '0') out.blankPasswordAccount = false; // blank network logon actually succeeded
+  return out;
+}
+
+async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTransport): Promise<Awaited<ReturnType<typeof parseRdpPolicyLine>>> {
+  if (!host.rdp?.user) return {};
   try {
+    const b64 = rdpPolicyCommand(address, host.rdp.user);
     const res = await ssh.exec(host, address, `powershell -NoProfile -EncodedCommand ${b64}`, { timeoutMs: 20000 });
     const line = res.stdout.split(/\r?\n/).find((l) => l.includes('lbp=')) ?? '';
-    const lbp = /lbp=(\d+)/.exec(line);
-    const nla = /nla=(\d+)/.exec(line);
-    const nu = /netuse=(-?\d+)/.exec(line);
-    const ec = /err=(\d+)/.exec(line);
-    if (lbp) out.limitBlankPasswordUse = Number(lbp[1]);
-    if (nla) out.nlaRequired = nla[1] === '1';
-    if (nu) out.netuseCode = nu[1];
-    if (ec) out.netuseErr = ec[1];
-    // Only System error 1327 ("blank passwords aren't allowed") proves the
-    // blank-password rejection. cmd's exit code alone is NOT enough: a wrong
-    // NON-blank password also exits 2 (error 1326), so the code must not be
-    // reported as "the account is blank". The error number decides.
-    if (ec && ec[1] === '1327') out.blankPasswordAccount = true;
-    else if (ec) out.blankPasswordAccount = false;
-    else if (nu && nu[1] === '0') out.blankPasswordAccount = false; // blank network logon actually succeeded
+    return parseRdpPolicyLine(line);
   } catch {
-    /* best effort */
+    return {};
   }
-  return out;
+}
+
+// Literal (not regex) termsrv/<address> credential lookup — an address is data,
+// never a pattern; regex metacharacters in it used to make `new RegExp` throw.
+export function hasTermsrvTarget(cmdkeyOut: string, address: string): boolean {
+  return cmdkeyOut.toLowerCase().includes(`termsrv/${address.toLowerCase()}`);
 }
 
 async function hasStoredRdpCredential(address: string): Promise<boolean> {
   try {
     const { stdout } = await execFileP('cmdkey.exe', ['/list'], { timeout: 8000 });
-    return new RegExp(`target=.*termsrv/${address}\\b`, 'i').test(stdout);
+    return hasTermsrvTarget(stdout, address);
   } catch {
     return false;
   }
@@ -288,7 +306,7 @@ function localBroadcastTargets(): string[] {
   return [...targets];
 }
 
-function ipToLong(s: string): number | null {
+export function ipToLong(s: string): number | null {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
   if (!m) return null;
   const parts = m.slice(1).map(Number);
@@ -296,7 +314,7 @@ function ipToLong(s: string): number | null {
   return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
 }
 
-function longToIp(n: number): string {
+export function longToIp(n: number): string {
   return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
 }
 
@@ -307,7 +325,7 @@ export interface ArpEntry {
   source: string;
 }
 
-function parseArpWindows(text: string): ArpEntry[] {
+export function parseArpWindows(text: string): ArpEntry[] {
   const out: ArpEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
     const m = /^\s*([0-9.]+)\s+([0-9a-fA-F-]{17})\s+(dynamic|static)/.exec(line);
@@ -316,10 +334,14 @@ function parseArpWindows(text: string): ArpEntry[] {
   return out;
 }
 
-function parseArpLinux(text: string): ArpEntry[] {
+export function parseArpLinux(text: string): ArpEntry[] {
   const out: ArpEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
-    const m = /^([0-9.]+)\s+(?:incomplete|([0-9a-fA-F:]{17}))\b.*?\bon\s+(\S+)/.exec(line);
+    // net-tools `arp -an` prefixes every entry with "? (IP) at "; busybox and
+    // `arp -n` sometimes emit a bare leading IP. Accept both. The old pattern
+    // required a leading digit and matched NEITHER, so arp_table was silently
+    // empty on every real Linux host.
+    const m = /^\??\s*\(?([0-9.]+)\)?\s+at\s+(?:<incomplete>|([0-9a-fA-F:]{17})).*?\bon\s+(\S+)/.exec(line);
     if (m) out.push({ address: m[1], mac: m[2]?.toUpperCase() ?? null, iface: m[3], source: 'arp' });
   }
   return out;
