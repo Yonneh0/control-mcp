@@ -52,7 +52,7 @@ Nothing is asserted that was not observed:
   `net_probe_tcp`, `wol_wake`, `arp_table`, `cdp_discover`) and the adb tools keep
   working with no config at all.
 
-## Tools (51)
+## Tools (54)
 
 **Host discovery**
 - `host_list` — configured hosts (name, address, os, alternate addresses, declared
@@ -147,6 +147,20 @@ pixels.
 > RDP instead of blind `rdp_click x,y` — is deliberate future work; the Android
 > side is the complete model today.
 
+**Windows host admin** (over SSH PowerShell; admin effect measured, state read back)
+- `win_firewall` — `status` | `set_profile` (name + enabled) | `add_allow_rule`
+  (inbound Allow for a port) | `remove_rule`; a mutation reads the setting/rule back
+  and the result states the effective privilege, so a standard-integrity token is
+  reported, not shown as a silent success.
+- `win_defender` — `status` (real-time / signature version / scan-overdue) |
+  `realtime_set` (on/off, reads the boolean back) | `signature_update`. Scans are not
+  started here (they outlive a tool timeout).
+- `win_update` — `status` (pending count + top titles + `usoclient` availability via
+  the Update COM API) and async `scan`/`download`/`install` via `usoclient`; no auto
+  reboot, and progress is verified with `status` (usoclient's own exit code is unreliable).
+- PowerShell is invoked via `-EncodedCommand` so it works whatever the remote login
+  shell is (Windows OpenSSH often defaults to `cmd.exe`).
+
 **Power** (loud by design)
 - `host_reboot` / `host_shutdown` — require `confirm: "yes"`, refuse any host that
   is localhost/loopback or shares an address with the machine running control-mcp,
@@ -157,7 +171,7 @@ pixels.
 
 ```
 src/index.ts            stdio MCP server (stdout is JSON-RPC only; stderr is the log)
-src/tools/registry.ts   the 51 tools + the audited pipeline: zod -> safety gate -> transport
+src/tools/registry.ts   the 54 tools + the audited pipeline: zod -> safety gate -> transport
 src/config/             TOML config: schema (zod, .strict()), loader, secret resolution
 src/transports/ssh.ts       ssh2 exec, persistent shell sessions (in-band sentinel), SFTP streaming
 src/transports/netprobe.ts  ping / TCP probe / ARP / Wake-on-LAN / CDP raw-frame listener / RDP policy probe
@@ -213,6 +227,20 @@ result. A real scripted session is normally driven by launching the MsRdpEx-enab
 client on the target itself. The screen-capture surface for a *connected* session is
 not bound, because with no reachable connected session it would be FFI that fails at
 first use.
+
+**Measured on the acceptance box (2026-11).** `rdp_connect` there returned
+`connected=false, attempted=true, lastError=DllGetClassObject(CLID
+MsRdpClientNotSafeForScripting) -> 0x80040111` (REGDB_E_CLASSNOTREG). `node` and
+`MsRdpEx.dll` are both x64 (not a bitness problem), and the *Microsoft* control's
+CLSID is registered, but that MsRdpEx build does not serve the requested CLSID through
+its exported `DllGetClassObject` (`MsRdpEx.MsRdpClientNotSafeForScripting` has no
+ProgID). So control **creation**, not the session hook, is the first blocker here:
+scripted RDP on that box needs a matching MsRdpEx registered for the runtime. This was
+measured, not assumed — the tool reported the failure verbatim rather than faking a
+session. `host_status` still measures the target's real RDP policy over SSH
+(listeners, `LimitBlankPasswordUse`, NLA, a live logon probe) independent of the local
+MsRdpEx control, and reported an accurate "refused — blank password + NLA" verdict on
+a second box.
 
 **ADB** — `adb` is invoked as argv arrays, never through `cmd.exe`. A missing binary
 is `adb_status → available: false` and `CAPABILITY_UNAVAILABLE` on the operations

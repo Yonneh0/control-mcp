@@ -15,6 +15,7 @@ import { captureWindowPng } from '../transports/winsnapshot.js';
 import { EventMonitor, describeEventSinkPolicy, type SystemEvent } from '../transports/monitor.js';
 import { adminRoot, adbAvailable, adbExec, currentApp, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
 import type { AppsScope, SettingsNs, UiNode, UiPreset, UiTarget } from '../transports/adb.js';
+import { defenderRealtimeSetCommand, defenderSignatureUpdateCommand, defenderStatusCommand, extractJson, firewallAddRuleCommand, firewallRemoveRuleCommand, firewallSetProfileCommand, firewallStatusCommand, updateStatusCommand, updateTriggerCommand } from '../transports/windows.js';
 import { join, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -329,6 +330,31 @@ function formatEvent(e: SystemEvent): string {
   return `${e.host} [${e.level}] ${e.category}: ${e.summary}`;
 }
 
+// Measure the effective privilege of the SSH account so admin-style tools can
+// report what a command actually ran with (Windows: the High mandatory label
+// S-1-16-12288; Linux: uid 0). Read-only, and 'not measured' on any doubt.
+async function measurePrivilege(
+  run: (h: HostConfig, toolName: string, command: string, timeoutMs: number) => Promise<ExecResult>,
+  h: HostConfig,
+): Promise<string> {
+  const probeCmd = h.os === 'windows' ? 'whoami /groups' : 'id -u';
+  let privilege = 'not measured (introspection unavailable)';
+  try {
+    const probe = await run(h, 'admin_exec_probe', probeCmd, 15000);
+    if (h.os === 'windows') {
+      if (probe.stdout.includes('S-1-16-12288')) privilege = 'elevated-high-integrity';
+      else if (probe.stdout.includes('S-1-16-')) privilege = 'standard-integrity (NOT elevated; admin effect needs an elevated sshd token)';
+    } else {
+      const uid = probe.stdout.trim();
+      if (uid === '0') privilege = 'root';
+      else if (/^\d+$/.test(uid)) privilege = `non-root (uid ${uid}; sudo may still work if passwordless)`;
+    }
+  } catch {
+    /* probe failures never block the actual command; privilege stays 'not measured' */
+  }
+  return privilege;
+}
+
 export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh: SshTransport): () => void {
   const p = createPipeline(server, cfg, ssh);
 
@@ -408,32 +434,129 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     },
     async ({ host, command, timeoutMs, override }) => {
       const h = p.requireHost(host);
-      // Measure the effective privilege of the SSH account itself so the result
-      // says what the command actually ran with. Robust and read-only: run the
-      // introspection command and inspect ITS output rather than trusting a
-      // pipeline's exit code (a missing findstr would otherwise fake "STANDARD").
-      // We report 'not measured' whenever the probe is inconclusive.
-      const probeCmd = h.os === 'windows' ? 'whoami /groups' : 'id -u';
-      let privilege = 'not measured (introspection unavailable)';
-      try {
-        const probe = await p.runChecked(h, 'admin_exec_probe', probeCmd, 15000);
-        if (h.os === 'windows') {
-          if (probe.stdout.includes('S-1-16-12288')) privilege = 'elevated-high-integrity';
-          else if (probe.stdout.includes('S-1-16-')) privilege = 'standard-integrity (NOT elevated; admin effect needs an elevated sshd token)';
-          // else: whoami gave us no mandatory-label line -> leave 'not measured'.
-        } else {
-          const uid = probe.stdout.trim();
-          if (uid === '0') privilege = 'root';
-          else if (/^\d+$/.test(uid)) privilege = `non-root (uid ${uid}; sudo may still work if passwordless)`;
-        }
-      } catch {
-        /* probe failures never block the actual command; privilege stays 'not measured' */
-      }
+      // Measure the effective privilege of the SSH account so the result says
+      // what the command actually ran with (never assume elevation).
+      const privilege = await measurePrivilege((hh, tt, cc, mm) => p.runChecked(hh, tt, cc, mm), h);
       const res = await p.runChecked(h, 'admin_exec', command, timeoutMs, override);
       return toolText(
         `admin_exec ${h.name}: ${exitLabel(res)} [effective privilege: ${privilege}]${res.truncated ? ' [output truncated; full data in structuredContent]' : ''}${outputPreview(res)}`,
         { host: h.name, address: h.address, command, privilege, stdout: res.stdout, stderr: res.stderr, exitCode: res.code, signal: res.signal, truncated: res.truncated, timedOut: res.timedOut, durationMs: res.durationMs },
       );
+    },
+  );
+
+  // ------------------------------------------------------- windows controls --
+  // Firewall / Defender / Update over SSH PowerShell. Every mutation reads the
+  // affected setting back and reports the effective privilege, so a success is
+  // always measured and a token that cannot elevate is reported, not hidden.
+  const winPriv = (h: HostConfig) => measurePrivilege((hh, tt, cc, mm) => p.runChecked(hh, tt, cc, mm), h);
+  const requireWindows = (h: HostConfig): void => {
+    if (h.os !== 'windows') throw new ControlError('CAPABILITY_UNAVAILABLE', `${h.name} is ${h.os}; these controls are Windows-only`, { host: h.name, os: h.os });
+  };
+
+  p.define(
+    'win_firewall',
+    'Windows Firewall control over SSH PowerShell. action: status (all profiles), set_profile (name + enabled, reads state back), add_allow_rule (inbound Allow for a port; reads the rule back), remove_rule (idempotent, verified). Mutations need the elevated sshd token; effective privilege and the measured read-back are always reported.',
+    {
+      host: z.string().optional(),
+      action: z.enum(['status', 'set_profile', 'add_allow_rule', 'remove_rule']),
+      name: z.enum(['Domain', 'Private', 'Public']).optional().describe('profile for set_profile'),
+      enabled: z.boolean().optional().describe('target state for set_profile'),
+      ruleName: z.string().min(1).max(200).optional().describe('rule DisplayName for add_allow_rule / remove_rule'),
+      port: z.number().int().min(1).max(65535).optional(),
+      protocol: z.enum(['tcp', 'udp']).optional(),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, action, name, enabled, ruleName, port, protocol, timeoutMs }) => {
+      const h = p.requireHost(host);
+      requireWindows(h);
+      if (action === 'status') {
+        const res = await p.runChecked(h, 'win_firewall', firewallStatusCommand(), timeoutMs);
+        if (res.code !== 0) return toolError('REMOTE_ERROR', `firewall status failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name });
+        const profiles = extractJson(res.stdout);
+        return toolText(`win_firewall ${h.name}: ${JSON.stringify(profiles ?? res.stdout.trim())}`, { host: h.name, profiles });
+      }
+      if (action === 'set_profile' && (name === undefined || enabled === undefined)) {
+        throw new ControlError('BAD_ARGS', 'set_profile needs name and enabled', { action });
+      }
+      if (action === 'add_allow_rule' && (!ruleName || port === undefined)) {
+        throw new ControlError('BAD_ARGS', 'add_allow_rule needs ruleName and port (protocol defaults to tcp)', { action });
+      }
+      if (action === 'remove_rule' && !ruleName) throw new ControlError('BAD_ARGS', 'remove_rule needs ruleName', { action });
+      const command =
+        action === 'set_profile' ? firewallSetProfileCommand(name as string, enabled as boolean)
+        : action === 'add_allow_rule' ? firewallAddRuleCommand(ruleName as string, port as number, protocol ?? 'tcp')
+        : firewallRemoveRuleCommand(ruleName as string);
+      const res = await p.runChecked(h, 'win_firewall', command, timeoutMs);
+      const privilege = await winPriv(h);
+      const readBack = res.stdout.trim().slice(0, 300);
+      if (res.code !== 0) {
+        return toolError('REMOTE_ERROR', `firewall ${action} failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — check the arguments' : 'this mutation needs an elevated sshd token; a standard-integrity token cannot change the firewall, and the read-back above shows the unchanged state');
+      }
+      return toolText(`win_firewall ${action} on ${h.name} [privilege: ${privilege}]; read-back: ${readBack}`, { host: h.name, action, privilege, result: extractJson(res.stdout), readBack });
+    },
+  );
+
+  p.define(
+    'win_defender',
+    'Windows Defender control over SSH PowerShell. action: status (real-time / signature version / scan-overdue snapshot), realtime_set (on|off, reads the boolean back), signature_update (Update-MpSignature, reads the version back). Scans are intentionally NOT started here — they run for minutes and would outlive a tool timeout. Mutations need the elevated sshd token; privilege and read-back are always reported.',
+    {
+      host: z.string().optional(),
+      action: z.enum(['status', 'realtime_set', 'signature_update']),
+      on: z.boolean().optional().describe('real-time protection target for realtime_set'),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, action, on, timeoutMs }) => {
+      const h = p.requireHost(host);
+      requireWindows(h);
+      if (action === 'status') {
+        const res = await p.runChecked(h, 'win_defender', defenderStatusCommand(), timeoutMs);
+        if (res.code !== 0) return toolError('REMOTE_ERROR', `defender status failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name });
+        const status = extractJson(res.stdout);
+        return toolText(`win_defender ${h.name}: ${JSON.stringify(status ?? res.stdout.trim())}`, { host: h.name, status });
+      }
+      if (action === 'realtime_set' && on === undefined) {
+        throw new ControlError('BAD_ARGS', 'realtime_set needs on:true|false — refusing to guess, because the wrong guess would disable real-time protection', { action });
+      }
+      const desired = action === 'realtime_set' ? (on as boolean) : undefined;
+      const command = action === 'realtime_set' ? defenderRealtimeSetCommand(desired as boolean) : defenderSignatureUpdateCommand();
+      const res = await p.runChecked(h, 'win_defender', command, timeoutMs);
+      const privilege = await winPriv(h);
+      const readBack = res.stdout.trim().slice(0, 200);
+      if (res.code !== 0) {
+        return toolError('REMOTE_ERROR', `defender ${action} failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — check the arguments' : 'this mutation needs an elevated sshd token');
+      }
+      if (action === 'realtime_set') {
+        const actual = readBack.toLowerCase() === 'true';
+        return toolText(`win_defender realtime_set ${desired} on ${h.name} [privilege: ${privilege}]; read-back RealTimeProtectionEnabled=${actual}${actual === desired ? ' (matched)' : ' (DID NOT MATCH)'}`, { host: h.name, action, desired, actual, matched: actual === desired, privilege });
+      }
+      return toolText(`win_defender signature_update on ${h.name} [privilege: ${privilege}]; new AV signature: ${readBack}`, { host: h.name, action, signatureVersion: readBack, privilege });
+    },
+  );
+
+  p.define(
+    'win_update',
+    'Windows Update over SSH. action: status (pending count + top titles + usoclient availability via the Update COM API) and the asynchronous triggers scan|download|install via usoclient — these kick the Update session and return immediately (usoclient\'s own exit code is unreliable, so verify progress with status). No automatic reboot. Reads work on any token; triggers need the elevated sshd token.',
+    {
+      host: z.string().optional(),
+      action: z.enum(['status', 'scan', 'download', 'install']),
+      timeoutMs: z.number().int().min(100).max(120000).default(60000),
+    },
+    async ({ host, action, timeoutMs }) => {
+      const h = p.requireHost(host);
+      requireWindows(h);
+      if (action === 'status') {
+        const res = await p.runChecked(h, 'win_update', updateStatusCommand(), timeoutMs);
+        const parsed = extractJson(res.stdout) as { PendingCount?: number; Top?: string[]; Usoclient?: boolean; error?: string } | null;
+        if (parsed && parsed.error) return toolError('REMOTE_ERROR', `win_update status: ${parsed.error}`, { host: h.name, usoclient: parsed.Usoclient });
+        if (!parsed) return toolError('REMOTE_ERROR', `win_update status returned no parseable result: ${res.stdout.trim().slice(0, 160)}`, { host: h.name });
+        return toolText(`${h.name}: ${parsed.PendingCount ?? '?'} pending update(s); usoclient=${parsed.Usoclient}${parsed.Top?.length ? `\n` + parsed.Top.map((t) => `- ${t}`).join('\n') : ''}`, { host: h.name, pendingCount: parsed.PendingCount, usoclient: parsed.Usoclient, top: parsed.Top });
+      }
+      const res = await p.runChecked(h, 'win_update', updateTriggerCommand(action), timeoutMs);
+      const privilege = await winPriv(h);
+      const m = /USO_EXIT=(-?\d+)/.exec(res.stdout);
+      const exitTok = m ? m[1] : 'n/a';
+      return toolText(`win_update ${action} triggered on ${h.name} via usoclient (USO_EXIT=${exitTok}) [privilege: ${privilege}] — asynchronous; verify with win_update status`, { host: h.name, action, usoclientExit: exitTok, privilege, stdout: res.stdout.trim().slice(0, 200) });
     },
   );
 

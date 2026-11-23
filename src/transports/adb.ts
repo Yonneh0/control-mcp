@@ -799,9 +799,13 @@ const MEDIA_DISPATCH: Record<string, string> = {
   stop: 'stop',
   rewind: 'rewind',
   'fast-forward': 'fast-forward',
-  volume_up: 'volume_up',
-  volume_down: 'volume_down',
-  mute: 'volume_mute',
+};
+// Volume is global stream control, not a media_session verb: `cmd media_session
+// dispatch volume_up` is not accepted, so these go straight to a keyevent.
+const MEDIA_VOLUME_KEY: Record<string, number> = {
+  volume_up: 24,
+  volume_down: 25,
+  mute: 164,
 };
 
 export interface NowPlaying {
@@ -810,7 +814,6 @@ export interface NowPlaying {
   title?: string;
   artist?: string;
   package?: string;
-  raw?: string;
 }
 
 // Parse the active-session block out of `dumpsys media_session`. Formats vary
@@ -841,24 +844,39 @@ export async function nowPlaying(serial: string, timeoutMs = 15000): Promise<Now
 export async function mediaControl(serial: string, action: string, timeoutMs = 15000): Promise<{ dispatched: string; via: 'media_session' | 'keyevent'; output: string; nowPlaying: NowPlaying }> {
   serial = needSerial(serial);
   const lower = action.trim().toLowerCase();
-  const mapped = MEDIA_DISPATCH[lower];
-  if (!mapped) {
-    throw new ControlError('BAD_ARGS', `unknown media action "${action}"`, { action, allowed: Object.keys(MEDIA_DISPATCH) });
+  const allowed = [...Object.keys(MEDIA_DISPATCH), ...Object.keys(MEDIA_VOLUME_KEY)];
+  if (!allowed.includes(lower)) {
+    throw new ControlError('BAD_ARGS', `unknown media action "${action}"`, { action, allowed });
   }
-  let via: 'media_session' | 'keyevent' = 'media_session';
-  let r = await adbExec(serial, `cmd media_session dispatch ${mapped}`, timeoutMs);
-  const looksBroken = r.code !== 0 || /Can't find|No such|Error|Exception/i.test(r.stdout + r.stderr);
-  if (looksBroken) {
+
+  let via: 'media_session' | 'keyevent';
+  let dispatched: string;
+  let output = '';
+
+  if (MEDIA_VOLUME_KEY[lower] !== undefined) {
+    await inputKey(serial, MEDIA_VOLUME_KEY[lower], timeoutMs);
     via = 'keyevent';
-    const codeName = `media_${lower.replace(/-/g, '_')}`;
-    const code = resolveKeyCode(codeName);
-    if (code === null) {
-      throw new ControlError('REMOTE_ERROR', `media_session dispatch failed and no keyevent fallback for "${action}": ${r.stderr.trim().slice(0, 120)}`, { serial, action });
+    dispatched = lower;
+  } else {
+    const mapped = MEDIA_DISPATCH[lower];
+    const r = await adbExec(serial, `cmd media_session dispatch ${mapped}`, timeoutMs);
+    output = (r.stdout + '\n' + r.stderr).trim();
+    const broken = r.code !== 0 || /Can't find|No such|Error|Exception/i.test(r.stdout + r.stderr);
+    if (broken) {
+      const code = resolveKeyCode(`media_${lower.replace(/-/g, '_')}`);
+      if (code === null) {
+        throw new ControlError('REMOTE_ERROR', `media_session dispatch failed and no keyevent fallback for "${action}": ${output.slice(0, 120)}`, { serial, action });
+      }
+      await inputKey(serial, code, timeoutMs);
+      via = 'keyevent';
+    } else {
+      via = 'media_session';
     }
-    await inputKey(serial, code, timeoutMs);
+    dispatched = mapped;
   }
+
   const np = await nowPlaying(serial, timeoutMs);
-  return { dispatched: mapped, via, output: (r.stdout + '\n' + r.stderr).trim(), nowPlaying: np };
+  return { dispatched, via, output, nowPlaying: np };
 }
 
 // ---- screen recording (bounded clip) -------------------------------------
