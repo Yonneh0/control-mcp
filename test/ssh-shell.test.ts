@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SshTransport, errCodeFromSsh, sentinelFor, wrapShellCommand, parseShellResult } from '../src/transports/ssh.js';
+import { SshTransport, errCodeFromSsh, sentinelFor, wrapShellCommand, parseShellResult, stripAnsi } from '../src/transports/ssh.js';
 import { ControlError } from '../src/errors.js';
 import type { ErrCode } from '../src/errors.js';
 import type { HostConfig } from '../src/config/schema.js';
@@ -67,6 +67,53 @@ describe('sentinel framing (per-command marker)', () => {
     const res = parseShellResult(buffer, marker);
     expect(res?.exit).toBe('0');
     expect(res?.output).toBe('hello\r\n'); // wrapper echo excluded
+  });
+
+  // cmd.exe (the Windows OpenSSH default shell) is where the reported failure
+  // lived: the POSIX printf sentinel is echoed back verbatim and never runs, so
+  // a completed command's marker never appeared and the waiter hung. The
+  // platform-aware wrapper uses `echo <marker>%errorlevel%`, which cmd DOES run.
+  it('cmd.exe: observes the marker and strips the %errorlevel% wrapper line', () => {
+    const marker = sentinelFor('sh-2', 1);
+    const buffer =
+      `C:\\Users\\y>echo hi\r\nhi\r\n` +
+      `C:\\Users\\y>echo ${marker}%errorlevel%\r\n` + // echoed back: literal %errorlevel%, must NOT match
+      `${marker}0\r\n`; // cmd ran it: marker + exit code -> this is what was never seen before
+    const res = parseShellResult(buffer, marker, 'windows');
+    expect(res?.exit).toBe('0');
+    expect(res?.output).toContain('hi');
+    expect(res?.output).not.toContain('%errorlevel%');
+  });
+
+  it('cmd.exe: reports a nonzero errorlevel honestly (not forced to 0)', () => {
+    const marker = sentinelFor('sh-2', 2);
+    const buffer = `C:\\>nope\r\n'nope' is not recognized\r\nC:\\>echo ${marker}%errorlevel%\r\n${marker}9009\r\n`;
+    expect(parseShellResult(buffer, marker, 'windows')?.exit).toBe('9009');
+  });
+
+  it('cmd.exe: before the exit line completes, still returns null (no false match)', () => {
+    const marker = sentinelFor('sh-2', 3);
+    const buffer = `C:\\Users\\y>echo hi\r\nhi\r\nC:\\Users\\y>echo ${marker}%errorlevel%\r\n`;
+    expect(parseShellResult(buffer, marker, 'windows')).toBeNull();
+  });
+
+  it('observes the marker even when a cursor-control code follows the digits (the real msi bytes)', () => {
+    const marker = sentinelFor('sh-2', 4);
+    // Real msi capture: the prompt emits ANSI cursor moves, so the exit digits
+    // are followed by ESC[… , not `\r\n` — the old requirement never matched.
+    const buffer = `yonneh@MSI C:\\>echo ${marker}%errorlevel%\r\n${marker}0\x1b[10;1Hyonneh@MSI C:\\>`;
+    const res = parseShellResult(buffer, marker, 'windows');
+    expect(res?.exit).toBe('0');
+  });
+
+  it('does not accept a number until a non-digit proves it complete (chunk-safe)', () => {
+    const marker = sentinelFor('sh-2', 5);
+    expect(parseShellResult(`x\n${marker}1`, marker)).toBeNull(); // buffer ends mid-number
+    expect(parseShellResult(`x\n${marker}12\r\n`, marker)?.exit).toBe('12');
+  });
+
+  it('stripAnsi removes control codes but keeps text, CR and LF', () => {
+    expect(stripAnsi('a\x1b[?25lb\x1b[7;1Hc\r\nd')).toBe('abc\r\nd');
   });
 });
 

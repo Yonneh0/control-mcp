@@ -20,6 +20,10 @@ export interface ShellSession {
   host: string;
   address: string;
   user: string;
+  /** The remote shell family, from HostConfig.os — selects the POSIX vs cmd.exe
+   *  sentinel so a completed command's marker is actually observable. cmd.exe is
+   *  the Windows OpenSSH default shell and cannot run printf/$?/{ … ; }. */
+  os: HostConfig['os'];
   createdAt: number;
   lastUsedAt: number;
   cwd: string | null;
@@ -63,25 +67,49 @@ export function sentinelFor(sessionId: string, seq: number): string {
   return `CTL_MCP_${s}_${seq}_END`;
 }
 
-// The line written to the shell: run <command>, then print the marker with the
-// command's exit code. printf captures $? portably; the `|| echo <marker>?`
-// fallback covers shells (cmd.exe) with no $?/printf, where the reader still
-// sees the marker (with a literal '?') and knows the command reached the end.
-export function wrapShellCommand(command: string, marker: string): string {
+// The shell family a session's remote login uses. Windows OpenSSH defaults to
+// cmd.exe (no printf/$?/{ … ; }), so the completion marker must be phrased per
+// shell — a marker the shell cannot produce is the difference between "command
+// finished, exit captured" and "waiter hangs, the session looks stuck."
+export type ShellPlatform = 'posix' | 'windows';
+
+// The line written to the shell: run <command>, then print <marker> followed by
+// the command's exit code, so the reader knows the command reached its end.
+export function wrapShellCommand(command: string, marker: string, platform: ShellPlatform = 'posix'): string {
+  if (platform === 'windows') {
+    // cmd.exe: a CRLF sequences the echo after the command; cmd expands
+    // %errorlevel% to the previous command's exit code.
+    return `${command}\r\necho ${marker}%errorlevel%\r\n`;
+  }
   return `${command}\n{ printf '\\n${marker}%s\\n' "$?" 2>/dev/null || echo ${marker}?; } 2>/dev/null\n`;
 }
 
-// Scan <buffer> for THIS command's completed marker. Returns the exit code and
-// the output up to (excluding) the echoed wrapper line, or null if the marker
-// has not completed. Only <marker> matches, so a stale marker from a different
-// command — a timed-out command that finished late — is ignored, not attributed.
-export function parseShellResult(buffer: string, marker: string): { exit: string; output: string } | null {
-  const re = new RegExp(`\\n${marker}(\\d+)\\r?\\n`);
+// Scan <buffer> for THIS command's completed marker (`\n<marker><digits>`).
+// The number is terminated by any following non-digit, NOT a required newline:
+// Windows prompts emit ANSI cursor codes right after the digits (e.g. `…END0`
+// ESC[10;1H), so demanding `\r?\n` would never match a real, completed marker.
+// The `(?=\D)` lookahead also makes chunked delivery safe — a buffer ending
+// mid-number is not accepted until a non-digit (a newline, prompt, or escape)
+// proves the number is complete. Returns the exit code and the output up to
+// (excluding) the echoed command line, or null if the marker has not completed.
+export function parseShellResult(buffer: string, marker: string, platform: ShellPlatform = 'posix'): { exit: string; output: string } | null {
+  const re = new RegExp(`\\n${marker}(\\d+)(?=\\D)`);
   const m = re.exec(buffer);
   if (!m) return null;
-  const echoAt = buffer.lastIndexOf(`{ printf '\\n${marker}`);
+  // Strip our own injected wrapper line from the reported output: POSIX echoes
+  // `{ printf '\n<marker>…`; cmd echoes `echo <marker>%errorlevel%`.
+  const echoPrefix = platform === 'windows' ? `echo ${marker}` : `{ printf '\\n${marker}`;
+  const echoAt = buffer.lastIndexOf(echoPrefix);
   const cut = echoAt >= 0 && echoAt < m.index ? echoAt : m.index;
   return { exit: m[1], output: buffer.slice(0, cut) };
+}
+
+// Strip terminal control sequences (CSI / OSC / two-char ESC) so callers get
+// text, not cursor-moves. Windows OpenSSH prompts emit these even with term=dumb.
+// Printable text and CR/LF/TAB are preserved.
+const ANSI_SEQ = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])/g;
+export function stripAnsi(s: string): string {
+  return s.replace(ANSI_SEQ, '');
 }
 
 function mapAuthError(err: Error): ControlError {
@@ -373,6 +401,7 @@ export class SshTransport {
       host: host.name,
       address,
       user: host.ssh.user,
+      os: host.os,
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
       cwd: null,
@@ -430,7 +459,7 @@ export class SshTransport {
       ? '\n[output exceeded the 2 MiB capture cap; earlier bytes were dropped]'
       : '';
     session.droppedFromBuffer = false;
-    w.resolve(res.output + `\n[exit ${res.exit}]` + note);
+    w.resolve(stripAnsi(res.output) + `\n[exit ${res.exit}]` + note);
   }
 
   // Wait for a specific command's marker. Resolves {output, timedOut}; on a
@@ -445,7 +474,7 @@ export class SshTransport {
         if (idx >= 0) session.pending.splice(idx, 1);
         const out = session.buffer;
         session.buffer = '';
-        resolve({ output: out + '\n[timeout: sentinel not seen; command may still be running]', timedOut: true });
+        resolve({ output: stripAnsi(out) + '\n[timeout: sentinel not seen; command may still be running]', timedOut: true });
       }, timeoutMs);
       session.pending.push({ marker, resolve: (v) => resolve({ output: v, timedOut: false }), reject, timer });
     });
@@ -461,8 +490,12 @@ export class SshTransport {
     session.channel.write('\x03');
     await new Promise<void>((r) => setTimeout(r, RESYNC_SETTLE_MS));
     session.buffer = '';
+    const platform: ShellPlatform = session.os === 'windows' ? 'windows' : 'posix';
+    // A no-op any shell runs and returns from, so the probe marker proves the
+    // prompt is back: rem (cmd) / true (POSIX).
+    const idle = platform === 'windows' ? 'rem ctl-resync' : 'true';
     const probe = sentinelFor(session.id, ++session.cmdSeq);
-    session.channel.write(wrapShellCommand('true', probe));
+    session.channel.write(wrapShellCommand(idle, probe, platform));
     const { timedOut } = await this.waitMarker(session, probe, timeoutMs);
     return !timedOut;
   }
@@ -493,8 +526,9 @@ export class SshTransport {
     }
     // Each command gets a unique marker (session id + command sequence), so a
     // late marker from a previous command can never be attributed to this one.
+    const platform: ShellPlatform = session.os === 'windows' ? 'windows' : 'posix';
     const marker = sentinelFor(session.id, ++session.cmdSeq);
-    session.channel.write(wrapShellCommand(command, marker));
+    session.channel.write(wrapShellCommand(command, marker, platform));
     const { output, timedOut } = await this.waitMarker(session, marker, timeoutMs);
     session.needsResync = timedOut;
     return { output, closed: session.closed, timedOut, resynced };
@@ -510,6 +544,7 @@ export class SshTransport {
       host: s.host,
       address: s.address,
       user: s.user,
+      os: s.os,
       createdAt: s.createdAt,
       lastUsedAt: s.lastUsedAt,
       cwd: s.cwd,
