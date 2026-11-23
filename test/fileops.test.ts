@@ -365,10 +365,11 @@ describe('buildGlobCommand — linux', () => {
 describe('buildGlobCommand — windows', () => {
   it('runs Get-ChildItem newest-first with a remote cap and ticks output', () => {
     const ps = decodePs(buildGlobCommand('windows', { root: 'C:\\logs', pattern: '*.log', filesOnly: true, maxResults: 25 }));
-    expect(ps).toContain("Get-ChildItem -LiteralPath 'C:\\logs' -Recurse -File -ErrorAction SilentlyContinue");
-    // -like is applied to FullName, so the relative pattern is rooted: otherwise
-    // a pattern that works on Linux would silently match nothing here.
-    expect(ps).toContain("-like 'C:\\logs\\*.log'");
+    expect(ps).toContain("Get-ChildItem -LiteralPath $r -Recurse -File -ErrorAction SilentlyContinue");
+    // The root is resolved to absolute in-script (a relative root would never
+    // match FullName), then wildcard-escaped as $rl and joined to the pattern.
+    expect(ps).toContain("(Resolve-Path -LiteralPath 'C:\\logs' -ErrorAction SilentlyContinue).ProviderPath");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + '*.log')");
     expect(ps).toContain('Sort-Object LastWriteTimeUtc -Descending');
     expect(ps).toContain('Select-Object -First 25');
     expect(ps).toContain('LastWriteTimeUtc.Ticks');
@@ -376,13 +377,13 @@ describe('buildGlobCommand — windows', () => {
 
   it('roots a relative multi-directory pattern and reads / as \\', () => {
     const ps = decodePs(buildGlobCommand('windows', { root: 'C:\\logs\\', pattern: 'src/**/*.ts', filesOnly: true, maxResults: 5 }));
-    expect(ps).toContain("-like 'C:\\logs\\src\\*.ts'");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + 'src\\*.ts')");
   });
 
   it('doubles single quotes inside a PowerShell single-quoted string', () => {
     const ps = decodePs(buildGlobCommand('windows', { root: "C:\\it's", pattern: "a'b*.log", filesOnly: true, maxResults: 5 }));
-    expect(ps).toContain("-LiteralPath 'C:\\it''s'");
-    expect(ps).toContain("-like 'C:\\it''s\\a''b*.log'");
+    expect(ps).toContain("(Resolve-Path -LiteralPath 'C:\\it''s' -ErrorAction SilentlyContinue).ProviderPath");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + 'a''b*.log')");
   });
 
   it('interpolates only a validated integer', () => {

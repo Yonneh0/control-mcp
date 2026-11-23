@@ -99,9 +99,6 @@ const psq = (v: string): string => `'${v.split("'").join("''")}'`;
 const collapseLinux = (p: string): string => p.replace(/\*\*\//g, '*').replace(/\*+/g, '*');
 // -like: the relative pattern is rooted, '/' is read as '\'.
 const collapseWin = (p: string): string => p.replace(/\*\*\//g, '*').replace(/\//g, '\\').replace(/\*+/g, '*');
-// about_Wildcards: wrapping a wildcard character in brackets makes it literal.
-// One pass, so brackets added by the escape are never re-escaped.
-const likeLiteral = (v: string): string => v.replace(/[[\]*?]/g, (c) => `[${c}]`);
 // A starting point that begins with '-' must be given as './x' (find has no '--').
 const guardedRoot = (root: string): string => (root.startsWith('-') ? `./${root}` : root);
 
@@ -335,11 +332,12 @@ describe('buildSearchCommand linux: argv reconstruction', () => {
 
 // ---------------------------------- buildGlobCommand — windows (Get-ChildItem) --
 
-describe('buildGlobCommand windows: -LiteralPath, -like and the outer wrapper', () => {
+describe('buildGlobCommand windows: Resolve-Path, $rl escaping and the outer wrapper', () => {
   it('pins the ordinary script', () => {
     const ps = winGlob('C:\\logs', '*.log', 25);
-    expect(ps).toContain("Get-ChildItem -LiteralPath 'C:\\logs' -Recurse -File -ErrorAction SilentlyContinue");
-    expect(ps).toContain("-like 'C:\\logs\\*.log'");
+    expect(ps).toContain("(Resolve-Path -LiteralPath 'C:\\logs' -ErrorAction SilentlyContinue).ProviderPath");
+    expect(ps).toContain("Get-ChildItem -LiteralPath $r -Recurse -File -ErrorAction SilentlyContinue");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + '*.log')");
     expect(ps).toContain('Sort-Object LastWriteTimeUtc -Descending');
     expect(ps).toContain('Select-Object -First 25');
     expect(ps).toContain('LastWriteTimeUtc.Ticks');
@@ -347,52 +345,54 @@ describe('buildGlobCommand windows: -LiteralPath, -like and the outer wrapper', 
 
   it('never lets a single quote break out of a PowerShell literal', () => {
     const ps = winGlob("C:\\it's", "a'b*.log");
-    expect(ps).toContain("-LiteralPath 'C:\\it''s'");
-    expect(ps).toContain("-like 'C:\\it''s\\a''b*.log'");
+    expect(ps).toContain("(Resolve-Path -LiteralPath 'C:\\it''s' -ErrorAction SilentlyContinue).ProviderPath");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + 'a''b*.log')");
   });
 
-  it('BUG-4: wildcard characters in the ROOT are escaped for -like', () => {
-    // The root is a literal path but -like reads [ ] * ? as wildcards, so the old
-    // command produced -like 'C:\logs[2024]\*.log'. Measured in PowerShell:
-    //   'C:\logs[2024]\a.log' -like 'C:\logs[2024]\*.log'  => False
-    //   'C:\logs[2024]\a.log' -like 'C:\logs[[]2024[]]\*.log' => True
-    // so a real directory named '[2024]' (or 'a*b', 'a?b') reported "no matches".
-    const cases: Array<[string, string]> = [
-      ['C:\\logs[2024]', 'C:\\logs[[]2024[]]'],
-      ['C:\\a*b', 'C:\\a[*]b'],
-      ['C:\\a?b', 'C:\\a[?]b'],
-      ['C:\\x[y]z*w?v', 'C:\\x[[]y[]]z[*]w[?]v'],
-      ['C:\\plain', 'C:\\plain'],
-    ];
-    for (const [root, escaped] of cases) {
-      expect(winGlob(root, '*.log')).toContain(`-like ${psq(`${escaped}\\*.log`)}`);
-    }
+  it('BUG-4: wildcard characters in the ROOT are escaped for -like, in-script', () => {
+    // The root is a literal path but -like reads [ ] * ? as wildcards, so a real
+    // directory named '[2024]' would otherwise act as a character class and report
+    // "no matches" (measured live on n100: the unescaped root returned 0 for a real
+    // '[2024]\' tree that exists). The escape runs in PowerShell on the RESOLVED
+    // absolute path (so relative roots work too): a single -replace wraps each of
+    // ] [ * ? in brackets (about_Wildcards). The capture group is essential — without
+    // the parens '$1' is inserted literally, exactly the bug a live run caught.
+    const ps = winGlob('C:\\logs[2024]', '*.log');
+    expect(ps).toContain("$rl = $r -replace '([][*?])', '[$1]'");
+    expect(ps).toContain("$_.FullName -like ($rl + '\\' + '*.log')");
+    // Pin the escaping TRANSFORM itself (a mirror of the PS regex + replacement) so a
+    // missing capture group — which yields the literal '[$1]' — fails here, not live.
+    const psEscape = (v: string): string => v.replace(/([[\]*?])/g, '[$1]');
+    expect(psEscape('C:\\logs[2024]')).toBe('C:\\logs[[]2024[]]');
+    expect(psEscape('C:\\a*b')).toBe('C:\\a[*]b');
+    expect(psEscape('C:\\a?b')).toBe('C:\\a[?]b');
+    expect(psEscape('C:\\x[y]z*w?v')).toBe('C:\\x[[]y[]]z[*]w[?]v');
+    expect(psEscape('C:\\plain')).toBe('C:\\plain');
   });
 
-  it('escapes the root exactly once (no double-escaping of the brackets it adds)', () => {
+  it('the root wildcard-escape is one regex pass, not naive chained replaces', () => {
     // A naive sequence of String.replace calls would turn 'C:\[a]' into
-    // 'C:\[[]]]a[]]' — the single pass of likeLiteral is what makes this correct.
-    expect(winGlob('C:\\[a]', '*.log')).toContain(`-like ${psq('C:\\[[]a[]]\\*.log')}`);
+    // 'C:\[[]]]a[]]'; the single -replace pass wraps each char once.
+    expect(winGlob('C:\\[a]', '*.log')).toContain("$rl = $r -replace '([][*?])', '[$1]'");
+    const psEscape = (v: string): string => v.replace(/([[\]*?])/g, '[$1]');
+    expect(psEscape('C:\\[a]')).toBe('C:\\[[]a[]]');
   });
 
   it('keeps the pattern wildcards it is supposed to have', () => {
-    expect(winGlob('C:\\logs', 'src/**/*.ts')).toContain("-like 'C:\\logs\\src\\*.ts'");
-    expect(winGlob('C:\\logs', 'a/**')).toContain("-like 'C:\\logs\\a\\*'");
-    expect(winGlob('C:\\logs', 'q?.log')).toContain("-like 'C:\\logs\\q?.log'");
+    expect(winGlob('C:\\logs', 'src/**/*.ts')).toContain("$_.FullName -like ($rl + '\\' + 'src\\*.ts')");
+    expect(winGlob('C:\\logs', 'a/**')).toContain("$_.FullName -like ($rl + '\\' + 'a\\*')");
+    expect(winGlob('C:\\logs', 'q?.log')).toContain("$_.FullName -like ($rl + '\\' + 'q?.log')");
   });
 
   it('BUG-5: a root that does not exist is an error, not a silent zero', () => {
-    // Measured with powershell.exe -EncodedCommand and a missing root:
-    //   Get-ChildItem -LiteralPath 'C:\nope' -Recurse -File -ErrorAction SilentlyContinue | ...
-    //   -> exit 1, stdout empty, stderr empty.
-    // file_search maps exit 1 to grep's "no matches" convention, so a root that was
-    // never there is reported as "0 match(es)". file_glob reports REMOTE_ERROR but
-    // with no evidence in either stream. The builder now tests the root itself and
-    // exits 2, which both callers already map to REMOTE_ERROR.
+    // Get-ChildItem on a missing root under SilentlyContinue exits 1 with empty
+    // stdout AND stderr; file_search reads exit 1 as grep's "no matches" and
+    // file_glob had no evidence. Resolve-Path doubles as the existence check: no
+    // match -> Write-Error + exit 2, which both callers already map to REMOTE_ERROR.
     const ps = winGlob('C:\\logs', '*.log');
-    expect(ps).toContain("Test-Path -LiteralPath 'C:\\logs'");
+    expect(ps).toContain("Resolve-Path -LiteralPath 'C:\\logs'");
     expect(ps).toContain('exit 2');
-    expect(winGlob("C:\\it's", '*')).toContain("Test-Path -LiteralPath 'C:\\it''s'");
+    expect(winGlob("C:\\it's", '*')).toContain("Resolve-Path -LiteralPath 'C:\\it''s'");
   });
 
   it('interpolates only a validated integer and nothing else into the outer command', () => {
@@ -407,13 +407,12 @@ describe('buildGlobCommand windows: -LiteralPath, -like and the outer wrapper', 
     }
   });
 
-  it('quotes root and pattern for every adversarial input', () => {
+  it('resolves the root and quotes the pattern for every adversarial input', () => {
     for (const root of NASTY) {
       for (const pattern of ['*.log', "a'b", 'x;y', '..']) {
         const ps = winGlob(root, pattern);
-        const baseW = root.replace(/[\\/]+$/, '');
-        expect(ps).toContain(`-LiteralPath ${psq(root)}`);
-        expect(ps).toContain(`-like ${psq(`${likeLiteral(baseW)}\\${collapseWin(pattern)}`)}`);
+        expect(ps).toContain(`Resolve-Path -LiteralPath ${psq(root)}`);
+        expect(ps).toContain(`-like ($rl + '\\' + ${psq(collapseWin(pattern))})`);
       }
     }
   });

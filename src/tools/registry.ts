@@ -16,6 +16,19 @@ import { EventMonitor, describeEventSinkPolicy, type SystemEvent } from '../tran
 import { adminRoot, adbAvailable, adbBinInfo, adbExec, currentApp, deviceState, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
 import type { AppsScope, SettingsNs, UiNode, UiPreset, UiTarget } from '../transports/adb.js';
 import { decodeWinEventJson, defenderRealtimeSetCommand, defenderSignatureUpdateCommand, defenderStatusCommand, eventQueryCommand, extractJson, firewallAddRuleCommand, firewallRemoveRuleCommand, firewallSetProfileCommand, firewallStatusCommand, isSelfSeverService, serviceChangeCommand, serviceStatusCommand, updateStatusCommand, updateTriggerCommand } from '../transports/windows.js';
+
+// When a PowerShell command run over ssh fails, stderr can carry the echoed
+// script, the CLIXML framing a redirected Write-Error produces, and the real
+// error text all at once. Slicing the first 200 chars then shows framing/echo and
+// buries the reason — e.g. win_service's "nothing was changed" guard sentence.
+// Prefer a line that names a known failure, else the last non-empty non-CLIXML
+// line; fall back to a leading slice only when stderr is nothing but framing.
+function psErrorReason(text: string, max = 240): string {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith('#<Objs'));
+  const preferred = lines.find((l) => /nothing was changed|did not resolve|read-back unverified|Cannot |not found|Access is denied|terminating|Exception/i.test(l));
+  const reason = preferred ?? lines[lines.length - 1] ?? text.trim();
+  return reason.length > max ? reason.slice(0, max) + '…' : reason;
+}
 import { applyPatch, buildGlobCommand, buildSearchCommand, looksBinary, parseFindOutput, parseGrepOutput, parseWinGlobOutput, parseWinSearchOutput, sliceLines } from '../transports/fileops.js';
 import { buildMetricsCommand, parseLinuxMetrics, parseWindowsMetrics } from '../transports/sysinfo.js';
 import { join, win32 } from 'node:path';
@@ -644,7 +657,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const res = await p.runChecked(h, 'win_update', updateTriggerCommand(action), timeoutMs);
       const privilege = await winPriv(h);
       if (res.code !== 0) {
-        return toolError('REMOTE_ERROR', `win_update ${action}: the command failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — usoclient may still have failed to start the session; check win_update status' : 'this trigger needs the elevated sshd token');
+        return toolError('REMOTE_ERROR', `win_update ${action}: the command failed (exit ${res.code}): ${psErrorReason(res.stderr || res.stdout)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — usoclient may still have failed to start the session; check win_update status' : 'this trigger needs the elevated sshd token');
       }
       const m = /USO_EXIT=(-?\d+)/.exec(res.stdout);
       if (!m) {
@@ -703,7 +716,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const rec = rb !== null && typeof rb === 'object' ? (Array.isArray(rb) ? (rb.length === 1 ? rb[0] : null) : rb) : null;
       const actual = rec && typeof (rec as Record<string, unknown>).Status === 'string' ? (rec as Record<string, unknown>).Status as string : null;
       if (res.code !== 0) {
-        return toolError('REMOTE_ERROR', `win_service ${action} "${service}" on ${h.name} failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, service, privilege }, privilege.includes('elevated') ? 'the token is elevated — the service may have dependents (stop/restart refuses without -Force), may be disabled, or the name may not match; run win_service status first' : 'this mutation typically needs the elevated sshd token; a standard-integrity token cannot start/stop most services');
+        return toolError('REMOTE_ERROR', `win_service ${action} "${service}" on ${h.name} failed (exit ${res.code}): ${psErrorReason(res.stderr || res.stdout)}`, { host: h.name, action, service, privilege }, privilege.includes('elevated') ? 'the token is elevated — the service may have dependents (stop/restart refuses without -Force), may be disabled, or the name may not match; run win_service status first' : 'this mutation typically needs the elevated sshd token; a standard-integrity token cannot start/stop most services');
       }
       if (action === 'restart') {
         return toolText(`win_service restart "${service}" on ${h.name} [privilege: ${privilege}]: command completed (exit 0); read-back Status=${actual ?? '<unparsed>'} — verify this is the state you want (no match is claimed for restart)`, { host: h.name, action, service, actual, privilege });
@@ -728,7 +741,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const h = p.requireHost(host);
       requireWindows(h);
       const res = await p.runChecked(h, 'win_events_query', eventQueryCommand(logName, levels, count), timeoutMs);
-      if (res.code !== 0) return toolError('REMOTE_ERROR', `win_events_query ${logName} on ${h.name} failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, logName, levels, count }, 'check the log name and that the sshd token may read the event log; retry, or run the raw Get-WinEvent via exec');
+      if (res.code !== 0) return toolError('REMOTE_ERROR', `win_events_query ${logName} on ${h.name} failed (exit ${res.code}): ${psErrorReason(res.stderr || res.stdout)}`, { host: h.name, logName, levels, count }, 'check the log name and that the sshd token may read the event log; retry, or run the raw Get-WinEvent via exec');
       const events = decodeWinEventJson(res.stdout);
       if (events === null) return toolError('REMOTE_ERROR', 'win_events_query: could not decode the event payload', { host: h.name, logName, levels, count, stdoutPreview: res.stdout.trim().slice(0, 200) }, 'the command may have failed (check the log name/permissions); retry, or run the raw Get-WinEvent via exec');
       const n = events.length;

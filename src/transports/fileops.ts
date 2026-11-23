@@ -82,13 +82,27 @@ function needMaxResults(maxResults: number): number {
 
 // PowerShell's -like reads [ ] * ? as wildcards, but the ROOT it is compared
 // against is a literal path: a directory really named 'logs[2024]' produced
-// -like 'C:\logs[2024]\*.log', which does not match the very path it came from
-// (measured in PowerShell: False, while 'C:\logs[[]2024[]]\*.log' is True), so the
-// tool reported "no matches" for a tree that exists. about_Wildcards: wrapping a
-// wildcard character in brackets makes it literal. One pass, so the brackets this
-// adds are never re-escaped.
-function likeLiteral(v: string): string {
-  return v.replace(/[[\]*?]/g, (c) => `[${c}]`);
+// Resolve the root to an absolute path BEFORE the -like filter. Get-ChildItem
+// returns absolute FullName, but a caller may pass a root relative to the remote
+// login dir (e.g. "logs"); building the -like pattern from that relative root
+// would never match the absolute FullName, so the glob silently reported "no
+// files" for a tree that exists (measured with a relative root on PowerShell).
+// Resolve-Path -LiteralPath turns it absolute (and doubles as the existence
+// check: no match -> Write-Error + exit 2, which both callers map to REMOTE_ERROR
+// — see winRootGuard). The ProviderPath is then wildcard-escaped for -like
+// (about_Wildcards: wrap a wildcard char in brackets to make it literal; regex
+// `[][*?]` matches ] [ * ?, a single pass so the added brackets are not
+// re-escaped), so a root like C:\logs[2024] matches itself rather than acting
+// as a character class.
+function winResolveRoot(root: string): string {
+  return (
+    `$r = (Resolve-Path -LiteralPath ${psq(root)} -ErrorAction SilentlyContinue).ProviderPath\n` +
+    `if (-not $r) {\n` +
+    `  Write-Error ${psq(`root is missing or unreadable: ${root}`)}\n` +
+    `  exit 2\n` +
+    `}\n` +
+    `$rl = $r -replace '([][*?])', '[$1]'\n`
+  );
 }
 
 // -ErrorAction SilentlyContinue is what keeps a permission-denied directory in the
@@ -124,12 +138,11 @@ export function buildGlobCommand(os: OS, o: { root: string; pattern: string; fil
     // tool would report "no matches" for a pattern that works on Linux. In
     // -like, '*' spans separators exactly like find's -path, so '**' collapses
     // the same way.
-    const baseW = root.replace(/[\\/]+$/, '');
-    const fullW = `${likeLiteral(baseW)}\\${pattern.replace(/\*\*\//g, '*').replace(/\//g, '\\').replace(/\*+/g, '*')}`;
+    const patternW = pattern.replace(/\*\*\//g, '*').replace(/\//g, '\\').replace(/\*+/g, '*');
     return psCommand(
-      winRootGuard(root) +
-      `Get-ChildItem -LiteralPath ${psq(root)} -Recurse -File -ErrorAction SilentlyContinue` +
-      ` | Where-Object { $_.FullName -like ${psq(fullW)} }` +
+      winResolveRoot(root) +
+      `Get-ChildItem -LiteralPath $r -Recurse -File -ErrorAction SilentlyContinue` +
+      ` | Where-Object { $_.FullName -like ($rl + '\\' + ${psq(patternW)}) }` +
       ` | Sort-Object LastWriteTimeUtc -Descending` +
       ` | Select-Object -First ${max}` +
       ` | ForEach-Object { "{0}\`t{1}" -f $_.LastWriteTimeUtc.Ticks, $_.FullName }`,
