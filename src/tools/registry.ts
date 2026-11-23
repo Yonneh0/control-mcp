@@ -62,7 +62,10 @@ function exitLabel(res: ExecResult): string {
 // structuredContent always carries the full stdout/stderr, but many clients show
 // only the text, so without a preview a failed command teaches the caller nothing
 // (just "exit 3"). On failure stderr leads; output is truncated rather than dropped.
-function outputPreview(res: ExecResult): string {
+// The param is the structural subset this needs, so both the SSH ExecResult and
+// the adb AdbExecResult can share it — an adb command's stdout must not be any
+// harder to see in the text view than an ssh command's.
+export function outputPreview(res: { stdout: string; stderr: string; code: number | null }): string {
   const cap = 1200;
   const take = (s: string): string => (s.length > cap ? `${s.slice(0, cap)}…` : s);
   const so = res.stdout.trim();
@@ -415,7 +418,9 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
           ? `ssh: READY — service listening and authenticating (user=${status.ssh.user})`
           : st === 'auth'
             ? `ssh: LISTENING but not authenticated (user=${status.ssh.user}): the port is open and the daemon answered; fix the key/password, the host is up`
-            : st === 'refused'
+            : st === 'listening'
+              ? `ssh: LISTENING — :${h.ssh.port} is open and the daemon answered, but the SSH handshake did not complete (the service is still starting up, or a key-exchange/host-key algorithm mismatch). The box is UP and the service is answering — do NOT wake it; retry shortly, and treat it as a config problem only if it persists`
+              : st === 'refused'
               ? `ssh: NOT LISTENING — the host is UP (it answered and refused the TCP connect on :${h.ssh.port}); the SSH service is stopped or not started yet (common seconds after boot). Do NOT try to wake this box`
               : st === 'filtered'
                 ? `ssh: NO RESPONSE — the host answers ping but :${h.ssh.port} timed out/reset (service down or firewalled-to-drop). The box itself is reachable`
@@ -1397,7 +1402,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     async ({ serial, command, timeoutMs }) => {
       const res = await adbExec(serial, command, timeoutMs);
       if (res.missing) return toolError('CAPABILITY_UNAVAILABLE', `adb not installed: cannot run "${command}" on ${serial}`, { serial, command }, 'install Android platform-tools and put it on PATH, or set CONTROL_MCP_ADB_PATH to the adb binary; run adb_status to see which path control-mcp resolved');
-      return toolText(`adb exec ${serial}: exit ${res.code ?? 'n/a'}`, { serial, command, ...res });
+      return toolText(`adb exec ${serial}: exit ${res.code ?? 'n/a'}` + outputPreview(res), { serial, command, ...res });
     },
   );
 

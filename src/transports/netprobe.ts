@@ -16,13 +16,21 @@ const execFileP = promisify(execFile);
 // cold boot, where Windows answers ICMP and opens RDP seconds before sshd
 // binds. A TCP RST (ECONNREFUSED) is positive proof the host is ALIVE, so it
 // must never be read as "down".
-export type SshProbeState = 'ready' | 'auth' | 'refused' | 'filtered' | 'down' | 'error';
+export type SshProbeState = 'ready' | 'auth' | 'listening' | 'refused' | 'filtered' | 'down' | 'error';
 
-export function classifySshState(pingOk: boolean, probe: { ok: boolean; error?: string } | null): SshProbeState {
+export function classifySshState(pingOk: boolean, probe: { ok: boolean; error?: string; tcpOpen?: boolean } | null): SshProbeState {
   if (!pingOk) return 'down';
   if (!probe) return 'down';
   if (probe.ok) return 'ready';
   const msg = probe.error ?? '';
+  // A reset/algorithm/slow failure recorded AFTER the raw TCP connection opened
+  // means a daemon IS answering: the service is UP. Report a listening verdict,
+  // never "down / firewalled" — that is reserved for the TCP-level failure below
+  // (where tcpOpen is false/absent, which preserves the pre-existing behaviour).
+  if (probe.tcpOpen) {
+    if (/all configured authentication|too many authentication|encrypted private|cannot parse (private )?key/i.test(msg)) return 'auth';
+    return 'listening';
+  }
   if (/authentication|no matching (key|method)|all configured authentication/i.test(msg)) return 'auth';
   if (/ECONNREFUSED/i.test(msg)) return 'refused';
   if (/ETIMEDOUT|timed out|handshake|ECONNRESET|EHOSTUNREACH|ENETUNREACH/i.test(msg)) return 'filtered';
@@ -168,7 +176,7 @@ export async function probeHost(host: HostConfig, ssh: SshTransport): Promise<Ho
   // Separate the HOST from the SSH SERVICE (see classifySshState): a box that
   // answers ICMP is up even if sshd has not bound its port yet.
   const hostUp = candidates.some((a) => interfaces[a]);
-  let sshProbe: { ok: boolean; error?: string } | null = null;
+  let sshProbe: { ok: boolean; error?: string; tcpOpen?: boolean } | null = null;
   if (pick) {
     sshProbe = await ssh.probe(host, pick.address);
   }
@@ -211,7 +219,7 @@ export async function probeHost(host: HostConfig, ssh: SshTransport): Promise<Ho
     address: pick?.address ?? host.address,
     os: host.os,
     hostUp,
-    ssh: { reachable: sshState === 'ready', listening: sshState === 'ready' || sshState === 'auth', state: sshState, user: host.ssh.user, error: sshError },
+    ssh: { reachable: sshState === 'ready', listening: sshState === 'ready' || sshState === 'auth' || sshState === 'listening', state: sshState, user: host.ssh.user, error: sshError },
     rdp: verdict,
     interfaces,
   };

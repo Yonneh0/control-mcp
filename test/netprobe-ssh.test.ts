@@ -25,6 +25,20 @@ describe('classifySshState', () => {
     expect(classifySshState(true, { ok: false, error: 'connect ECONNRESET' })).toBe('filtered');
   });
 
+  it('LISTENING when the port was proven open but the handshake reset (NOT "down")', () => {
+    // The bug this pins: ssh.probe now proves TCP-open first. An ECONNRESET that
+    // happens AFTER the socket connected means a daemon is answering (service is
+    // UP). The old probe reported the identical message as 'filtered' = "service
+    // down or firewalled" — a false negative for a healthy-but-settling service
+    // (measured live on msi right after an sshd reinstall). tcpOpen true reclassifies.
+    expect(classifySshState(true, { ok: false, tcpOpen: true, error: 'listening: handshake incomplete (read ECONNRESET)' })).toBe('listening');
+    expect(classifySshState(true, { ok: false, tcpOpen: true, error: 'Handshake failed: no matching key exchange method' })).toBe('listening');
+  });
+
+  it('still auth (not ready, not listening) when tcp is open but the credential failed', () => {
+    expect(classifySshState(true, { ok: false, tcpOpen: true, error: 'All configured authentication methods failed' })).toBe('auth');
+  });
+
   it('down when nothing answered ping, regardless of the probe', () => {
     expect(classifySshState(false, { ok: false, error: 'connect ECONNREFUSED 10.255.0.11:22' })).toBe('down');
     expect(classifySshState(false, null)).toBe('down');

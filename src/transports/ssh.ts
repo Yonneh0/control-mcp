@@ -1,4 +1,5 @@
 import { readFileSync, statSync } from 'node:fs';
+import { connect as netConnect, type Socket } from 'node:net';
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from 'ssh2';
 import { ControlError, type ErrCode } from '../errors.js';
 import type { HostConfig } from '../config/schema.js';
@@ -67,6 +68,39 @@ function mapAuthError(err: Error): ControlError {
     return new ControlError('HOST_UNREACHABLE', `SSH connection failed: ${msg}`);
   }
   return new ControlError('INTERNAL', `SSH error: ${msg}`);
+}
+
+// A raw TCP open check, independent of SSH negotiation. On failure it returns
+// the connect error code (ECONNREFUSED / ETIMEDOUT / ...) so the caller can
+// classify a network-level down/refused apart from a handshake failure.
+function rawTcpOpen(address: string, port: number, timeoutMs: number): Promise<{ open: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const sock: Socket = netConnect({ host: address, port, timeout: timeoutMs });
+    let done = false;
+    const finish = (open: boolean, error?: string) => {
+      if (done) return;
+      done = true;
+      sock.destroy();
+      resolve({ open, error });
+    };
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false, 'connect ETIMEDOUT'));
+    sock.once('error', (e) => finish(false, `connect ${(e as NodeJS.ErrnoException).code ?? e.message}`));
+  });
+}
+
+// Pure, testable mapping from an ssh2 handshake failure to a probe outcome,
+// given whether the raw TCP connection had already opened. Enforces two honesty
+// rules: an AUTHENTICATION failure is NEVER ok:true (ok:true would be reported
+// as "ready"/authenticating with a credential we did not resolve); and a
+// handshake failure AFTER the port was proven open is a LISTENING verdict
+// (tcpOpen true), never a network "down"/"firewalled".
+export function probeResultFromError(msg: string, tcpOpen: boolean): { ok: false; error: string; tcpOpen: boolean } {
+  if (/all configured authentication|cannot parse key|Encrypted private|Too many authentication/i.test(msg)) {
+    return { ok: false, error: 'All configured authentication methods failed', tcpOpen };
+  }
+  if (tcpOpen) return { ok: false, error: `listening: handshake incomplete (${msg})`, tcpOpen: true };
+  return { ok: false, error: msg, tcpOpen: false };
 }
 
 export class SshTransport {
@@ -149,12 +183,23 @@ export class SshTransport {
     return client;
   }
 
-  async probe(host: HostConfig, address: string): Promise<{ ok: boolean; error?: string }> {
+  async probe(host: HostConfig, address: string): Promise<{ ok: boolean; error?: string; tcpOpen?: boolean }> {
+    // Establish the network-level fact INDEPENDENTLY of the SSH handshake first:
+    // does the port accept a raw TCP connection at all? This separates "service
+    // down / firewalled" (TCP fails) from "a daemon is answering but the
+    // handshake did not finish" — e.g. an ECONNRESET during sshd's post-boot
+    // settling window, or an algorithm mismatch — which must NEVER be reported
+    // as "service down" (see probeResultFromError / classifySshState). The
+    // handshake budget matches the real connect (15s), not the old 5s, so a
+    // slow-but-healthy service is not cut off.
+    const tcp = await rawTcpOpen(address, host.ssh.port, 4000);
+    if (!tcp.open) return { ok: false, error: tcp.error ?? 'connect ETIMEDOUT', tcpOpen: false };
+
     const client = new Client();
     try {
       const keyPath = host.ssh.privateKeyPath ? expandPath(host.ssh.privateKeyPath) : undefined;
       await new Promise<void>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('timed out')), 6000);
+        const t = setTimeout(() => reject(new Error('Timed out while waiting for handshake')), 15000);
         client.once('error', (e) => {
           clearTimeout(t);
           reject(e);
@@ -167,21 +212,19 @@ export class SshTransport {
           host: address,
           port: host.ssh.port,
           username: host.ssh.user,
-          readyTimeout: 5000,
+          readyTimeout: 12000,
         };
         if (keyPath && requirePrivateKeyExists(keyPath)) cfg.privateKey = readFileSync(keyPath);
         const secret = readPasswordFromEnv(host.name, host.ssh.passwordEnv) ?? (host.ssh.password ? { value: host.ssh.password, source: 'config' } : undefined);
         if (secret) cfg.password = secret.value;
         client.connect(cfg);
       });
-      return { ok: true };
+      return { ok: true, tcpOpen: true };
     } catch (err) {
-      const e = err as Error;
-      if (/authentication/i.test(e.message)) return { ok: true, error: 'auth' };
-      return { ok: false, error: e.message };
+      return probeResultFromError((err as Error).message || String(err), true);
     } finally {
-      client.end();
-      client.destroy();
+      try { client.end(); } catch { /* already gone */ }
+      try { client.destroy(); } catch { /* already gone */ }
     }
   }
 
