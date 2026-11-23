@@ -11,11 +11,32 @@ import type { SshTransport } from './ssh.js';
 
 const execFileP = promisify(execFile);
 
+// Distinguishes "the host is down" from "the host is up but the SSH daemon is
+// not accepting on this port" — the distinction that matters most after a
+// cold boot, where Windows answers ICMP and opens RDP seconds before sshd
+// binds. A TCP RST (ECONNREFUSED) is positive proof the host is ALIVE, so it
+// must never be read as "down".
+export type SshProbeState = 'ready' | 'auth' | 'refused' | 'filtered' | 'down' | 'error';
+
+export function classifySshState(pingOk: boolean, probe: { ok: boolean; error?: string } | null): SshProbeState {
+  if (!pingOk) return 'down';
+  if (!probe) return 'down';
+  if (probe.ok) return 'ready';
+  const msg = probe.error ?? '';
+  if (/authentication|no matching (key|method)|all configured authentication/i.test(msg)) return 'auth';
+  if (/ECONNREFUSED/i.test(msg)) return 'refused';
+  if (/ETIMEDOUT|timed out|handshake|ECONNRESET|EHOSTUNREACH|ENETUNREACH/i.test(msg)) return 'filtered';
+  return 'error';
+}
+
 export interface HostStatus {
   name: string;
   address: string;
   os: string;
-  ssh: { reachable: boolean; user: string; error?: string };
+  // True when ANY configured interface answered ICMP — the box is on the network
+  // regardless of whether any service is listening.
+  hostUp: boolean;
+  ssh: { reachable: boolean; listening: boolean; state: SshProbeState; user: string; error?: string };
   rdp: RdpVerdict;
   interfaces: Record<string, boolean>;
 }
@@ -126,19 +147,24 @@ export async function probeHost(host: HostConfig, ssh: SshTransport): Promise<Ho
     }),
   );
   const pick = pickInterface(host.address, host.alternateAddresses, interfaces);
-  const sshAlive = Boolean(pick);
-  let sshError: string | undefined;
+  // Separate the HOST from the SSH SERVICE (see classifySshState): a box that
+  // answers ICMP is up even if sshd has not bound its port yet.
+  const hostUp = candidates.some((a) => interfaces[a]);
+  let sshProbe: { ok: boolean; error?: string } | null = null;
   if (pick) {
-    const probe = await ssh.probe(host, pick.address);
-    if (!probe.ok) sshError = probe.error;
-  } else {
-    sshError = 'no interface answered ping';
+    sshProbe = await ssh.probe(host, pick.address);
   }
+  const sshState = classifySshState(hostUp, sshProbe);
+  const sshError = !pick
+    ? 'no interface answered ping'
+    : sshProbe && !sshProbe.ok
+      ? sshProbe.error
+      : undefined;
 
   const rdpTcp = host.capabilities.rdp || host.rdp ? await probeTcp(pick?.address ?? host.address, host.rdp?.port ?? 3389) : { open: false };
   let policy: Awaited<ReturnType<typeof windowsRdpPolicy>> = {};
   // The blank-password probe only makes sense for a declared RDP account.
-  if (host.os === 'windows' && sshAlive && host.rdp?.user) {
+  if (host.os === 'windows' && hostUp && host.rdp?.user) {
     policy = await windowsRdpPolicy(host, pick?.address ?? host.address, ssh);
   }
 
@@ -157,7 +183,7 @@ export async function probeHost(host: HostConfig, ssh: SshTransport): Promise<Ho
   const verdict = classifyRdp({
     declared,
     tcpOpen: rdpTcp.open,
-    sshAlive,
+    sshAlive: hostUp,
     hasCredential,
     ...policy,
   });
@@ -166,7 +192,8 @@ export async function probeHost(host: HostConfig, ssh: SshTransport): Promise<Ho
     name: host.name,
     address: pick?.address ?? host.address,
     os: host.os,
-    ssh: { reachable: sshAlive && !sshError, user: host.ssh.user, error: sshError },
+    hostUp,
+    ssh: { reachable: sshState === 'ready', listening: sshState === 'ready' || sshState === 'auth', state: sshState, user: host.ssh.user, error: sshError },
     rdp: verdict,
     interfaces,
   };

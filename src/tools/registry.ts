@@ -13,10 +13,11 @@ import { CLSID_MsRdpClientNotSafeForScripting, DLL_PATH_DEFAULT, IID_IMsRdpExIns
 import { findAllWindows, hotkey, keyPress, mouseClick, typeText, VK } from '../transports/wininput.js';
 import { captureWindowPng } from '../transports/winsnapshot.js';
 import { EventMonitor, describeEventSinkPolicy, type SystemEvent } from '../transports/monitor.js';
-import { adminRoot, adbAvailable, adbExec, currentApp, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
+import { adminRoot, adbAvailable, adbBinInfo, adbExec, currentApp, deviceState, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
 import type { AppsScope, SettingsNs, UiNode, UiPreset, UiTarget } from '../transports/adb.js';
-import { defenderRealtimeSetCommand, defenderSignatureUpdateCommand, defenderStatusCommand, extractJson, firewallAddRuleCommand, firewallRemoveRuleCommand, firewallSetProfileCommand, firewallStatusCommand, updateStatusCommand, updateTriggerCommand } from '../transports/windows.js';
+import { decodeWinEventJson, defenderRealtimeSetCommand, defenderSignatureUpdateCommand, defenderStatusCommand, eventQueryCommand, extractJson, firewallAddRuleCommand, firewallRemoveRuleCommand, firewallSetProfileCommand, firewallStatusCommand, isSelfSeverService, serviceChangeCommand, serviceStatusCommand, updateStatusCommand, updateTriggerCommand } from '../transports/windows.js';
 import { applyPatch, buildGlobCommand, buildSearchCommand, looksBinary, parseFindOutput, parseGrepOutput, parseWinGlobOutput, parseWinSearchOutput, sliceLines } from '../transports/fileops.js';
+import { buildMetricsCommand, parseLinuxMetrics, parseWindowsMetrics } from '../transports/sysinfo.js';
 import { join, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -385,7 +386,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'host_status',
-    'Probe one host over every configured interface (ping, tcp/22, tcp/3389, Windows RDP policy) and report the honest verdict for each transport, including the exact reason RDP is refused; run this before any RDP tool when you do not know why a box is unreachable.',
+    'Probe one host over every configured interface (ping, tcp/22, tcp/3389, Windows RDP policy) and report the honest verdict for each transport, including the exact reason RDP is refused. It separates HOST reachability (does anything answer ping / ARP) from SSH-SERVICE reachability: a refused or filtered port on a pinging host means the box is UP and only the SSH daemon is down, NOT that you should try to wake it. Run this before any RDP tool when you do not know why a box will not connect.',
     { host: z.string().optional().describe('Host name or address (default when only one host is configured)') },
     async ({ host }) => {
       const h = p.requireHost(host);
@@ -394,10 +395,25 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const rd = status.rdp;
       const iface = Object.entries(status.interfaces).map(([a, ok]) => `${a}: ping ${ok ? 'ok' : 'failed'}`).join('; ');
       const degradedNote = pick?.degraded ? ` (via alternate ${pick.address}; the primary ${h.address} did not answer)` : '';
+      const upAddrs = Object.entries(status.interfaces).filter(([, ok]) => ok).map(([a]) => a);
+      const st = status.ssh.state;
+      const sshLine =
+        st === 'ready'
+          ? `ssh: READY — service listening and authenticating (user=${status.ssh.user})`
+          : st === 'auth'
+            ? `ssh: LISTENING but not authenticated (user=${status.ssh.user}): the port is open and the daemon answered; fix the key/password, the host is up`
+            : st === 'refused'
+              ? `ssh: NOT LISTENING — the host is UP (it answered and refused the TCP connect on :${h.ssh.port}); the SSH service is stopped or not started yet (common seconds after boot). Do NOT try to wake this box`
+              : st === 'filtered'
+                ? `ssh: NO RESPONSE — the host answers ping but :${h.ssh.port} timed out/reset (service down or firewalled-to-drop). The box itself is reachable`
+                : st === 'down'
+                  ? `ssh: host not reachable — no interface answered ping (likely powered off or off-network); this is the case WoL is for`
+                  : `ssh: probe error: ${status.ssh.error ?? 'unknown'}`;
       return toolText(
         `host ${status.name} via ${status.address}${degradedNote}\n` +
+        `host: ${status.hostUp ? 'UP' : 'DOWN'} (${upAddrs.length ? `pinged ${upAddrs.join(', ')}` : 'no interface answered'})\n` +
         `interfaces: ${iface || 'none probed'}\n` +
-        `ssh: reachable=${status.ssh.reachable} user=${status.ssh.user}${status.ssh.error ? ' error=' + status.ssh.error : ''}\n` +
+        sshLine + '\n' +
         `rdp: ${rd.available ? 'available' : 'refused'} -- ${rd.reason}`,
         { status, rdpVerdict: rd, interfacePick: pick },
       );
@@ -443,6 +459,59 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
         `admin_exec ${h.name}: ${exitLabel(res)} [effective privilege: ${privilege}]${res.truncated ? ' [output truncated at the 2 MiB transport cap — the remaining bytes were dropped and are NOT available elsewhere in this result; re-run piping to e.g. "tail -c 2097152" or redirect to a file]' : ''}${outputPreview(res)}`,
         { host: h.name, address: h.address, command, privilege, stdout: res.stdout, stderr: res.stderr, exitCode: res.code, signal: res.signal, truncated: res.truncated, timedOut: res.timedOut, durationMs: res.durationMs },
       );
+    },
+  );
+
+  // ---------------------------------------------------------- system metrics --
+  p.define(
+    'host_metrics',
+    'One SSH exec returning a normalized system snapshot for any SSH host: hostname, uptime, load average, cpu count, memory and swap, per-mount disk usage, and the top processes by memory. Linux reads /proc plus df -P and ps; Windows runs one encoded PowerShell script over Get-CimInstance. Every field a source cannot give is null with a matching note in warnings — never a guess (no MemAvailable means no memUsed; Windows has no load average and no per-process CPU%). Sizes are DECIMAL MB/GB (10^6 bytes), not MiB.',
+    {
+      host: z.string().optional(),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, timeoutMs }) => {
+      const h = p.requireHost(host);
+      const os: 'windows' | 'linux' = h.os === 'windows' ? 'windows' : 'linux';
+      const res = await p.runChecked(h, 'host_metrics', buildMetricsCommand(os), timeoutMs);
+      const metrics = os === 'windows' ? parseWindowsMetrics(extractJson(res.stdout)) : parseLinuxMetrics(res.stdout);
+      // The Linux command is joined with ';' so its exit code is head's: a
+      // non-zero exit (or a timeout) deserves a note, never a silent pass.
+      if (res.code !== 0) metrics.warnings.push(`snapshot may be partial (exit ${res.code ?? 'not reported'})`);
+
+      // Text built ONLY from non-null fields; every number on it is the
+      // structured object's own value (/1024 for GB) — no extra precision.
+      const gb = (mb: number): string => (mb / 1024).toFixed(1);
+      const pair = (used: number | null, total: number | null): string | null =>
+        total === null ? null : used === null ? `${gb(total)} GB total` : `${gb(used)}/${gb(total)} GB`;
+      const fmtUp = (sec: number): string => {
+        const s = Math.floor(sec);
+        const d = Math.floor(s / 86400);
+        const hr = Math.floor((s % 86400) / 3600);
+        const mn = Math.floor((s % 3600) / 60);
+        return d > 0 ? `${d}d ${hr}h` : hr > 0 ? `${hr}h ${mn}m` : mn > 0 ? `${mn}m` : `${s}s`;
+      };
+      const line = [`${h.name} (${os}):`];
+      line.push(`up ${metrics.uptimeSec === null ? '-' : fmtUp(metrics.uptimeSec)}`);
+      line.push(`load ${metrics.loadAvg === null ? '-' : metrics.loadAvg.map((v) => v.toFixed(2)).join(' ')}`);
+      line.push(`cpu ${metrics.cpuCount ?? '-'}`);
+      line.push(`mem ${pair(metrics.memUsedMb, metrics.memTotalMb) ?? '-'}`);
+      const swap = pair(metrics.swapUsedMb, metrics.swapTotalMb);
+      if (swap !== null) line.push(`swap ${swap}`);
+      for (const d of metrics.disks) {
+        const t = pair(d.usedMb, d.totalMb);
+        line.push(t ? `${d.mount} ${t}${d.usedPct === null ? '' : ` (${d.usedPct}%)`}` : `${d.mount} size not measured`);
+      }
+      const shown = metrics.topProcesses.slice(0, 3);
+      if (shown.length > 0) {
+        const more = metrics.topProcesses.length > shown.length ? ` (showing ${shown.length} of ${metrics.topProcesses.length})` : '';
+        line.push(`top: ${shown.map((pr) => `${pr.name}${pr.memMb === null ? '' : ` ${gb(pr.memMb)} GB`}`).join(', ')}${more}`);
+      }
+      const notes =
+        (metrics.warnings.length ? `\nwarnings: ${metrics.warnings.join('; ')}` : '') +
+        (res.truncated ? '\n[remote output was truncated at 2 MiB; this snapshot is incomplete]' : '') +
+        (res.timedOut ? '\n[timeout: TERM was requested; the remote command may still be running]' : '');
+      return toolText(`${line.join(', ')}${notes}`, { host: h.name, ...metrics });
     },
   );
 
@@ -586,6 +655,91 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       // session it starts is asynchronous and its progress is NOT observable
       // from here — so this reports invocation, not a verified trigger.
       return toolText(`win_update ${action}: usoclient invoked on ${h.name} (USO_EXIT=${exitTok}) [privilege: ${privilege}] — the trigger was NOT verified (usoclient is asynchronous); confirm with win_update status`, { host: h.name, action, usoclientExit: exitTok, privilege, invoked: true, verified: false, stdout: res.stdout.trim().slice(0, 200) });
+    },
+  );
+
+  p.define(
+    'win_service',
+    'Inspect and start/stop/restart Windows services over SSH PowerShell. action: status (all services, or one via service, optionally filtered by state; Name/DisplayName/Status/StartType, StartType joined from one Get-CimInstance Win32_Service pass). start/stop/restart ALWAYS read the service back and report the measured Status plus effective privilege — the read-back, not the exit code, decides whether the action is confirmed. Refuses stop/restart of services that carry the control path (sshd, ssh-agent, termservice, terminalservices, winrm) with TRANSPORT_SEVERED_RISK before running anything; start of those is allowed.',
+    {
+      host: z.string().optional(),
+      action: z.enum(['status', 'start', 'stop', 'restart']),
+      service: z.string().min(1).max(200).optional().describe('service name (required for start/stop/restart; optional -Name filter for status)'),
+      state: z.enum(['running', 'stopped']).optional().describe('status filter on current Status'),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, action, service, state, timeoutMs }) => {
+      const h = p.requireHost(host);
+      requireWindows(h);
+      if (action === 'status') {
+        const res = await p.runChecked(h, 'win_service', serviceStatusCommand(service, state), timeoutMs);
+        if (res.code !== 0) return toolError('REMOTE_ERROR', `win_service status failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, service, state }, 'Get-Service/Get-CimInstance may be blocked or the service filter wrong; retry with no service filter to see the full list');
+        const parsed = extractJson(res.stdout);
+        const services: Array<Record<string, unknown>> = parsed === null ? [] : Array.isArray(parsed) ? parsed as Array<Record<string, unknown>> : [parsed as Record<string, unknown>];
+        const running = services.filter((s) => String(s.Status ?? '').toLowerCase() === 'running').length;
+        const stopped = services.filter((s) => String(s.Status ?? '').toLowerCase() === 'stopped').length;
+        const other = services.length - running - stopped;
+        const summary = `win_service status on ${h.name}: ${services.length} service(s) — running=${running} stopped=${stopped}${other > 0 ? ' other=' + other : ''}`;
+        const one = services.length === 1 ? services[0] : null;
+        return toolText(
+          one
+            ? `${summary}\n${String(one.Name ?? '?')} "${String(one.DisplayName ?? '')}" — ${String(one.Status ?? '?')} (StartType=${String(one.StartType ?? 'unknown')})`
+            : summary,
+          { host: h.name, action: 'status', count: services.length, services },
+        );
+      }
+      if (!service) throw new ControlError('BAD_ARGS', `${action} needs a service name`, { action });
+      if (isSelfSeverService(service)) {
+        throw new ControlError(
+          'TRANSPORT_SEVERED_RISK',
+          `win_service refuses to ${action} "${service}" on ${h.name} — it carries the ssh path`,
+          { host: h.name, service },
+          'stopping it drops your control path; use the console (or RDP) on the box, or run the raw Stop/Restart-Service through exec with override=sever-transport if you truly mean it',
+        );
+      }
+      const res = await p.runChecked(h, 'win_service', serviceChangeCommand(service, action), timeoutMs);
+      const privilege = await winPriv(h);
+      const rb = extractJson(res.stdout);
+      const rec = rb !== null && typeof rb === 'object' ? (Array.isArray(rb) ? (rb.length === 1 ? rb[0] : null) : rb) : null;
+      const actual = rec && typeof (rec as Record<string, unknown>).Status === 'string' ? (rec as Record<string, unknown>).Status as string : null;
+      if (res.code !== 0) {
+        return toolError('REMOTE_ERROR', `win_service ${action} "${service}" on ${h.name} failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, service, privilege }, privilege.includes('elevated') ? 'the token is elevated — the service may have dependents (stop/restart refuses without -Force), may be disabled, or the name may not match; run win_service status first' : 'this mutation typically needs the elevated sshd token; a standard-integrity token cannot start/stop most services');
+      }
+      if (action === 'restart') {
+        return toolText(`win_service restart "${service}" on ${h.name} [privilege: ${privilege}]: command completed (exit 0); read-back Status=${actual ?? '<unparsed>'} — verify this is the state you want (no match is claimed for restart)`, { host: h.name, action, service, actual, privilege });
+      }
+      const desired = action === 'start' ? 'Running' : 'Stopped';
+      const matched = actual !== null && actual.toLowerCase() === desired.toLowerCase();
+      return toolText(`win_service ${action} "${service}" on ${h.name} [privilege: ${privilege}]: read-back Status=${actual ?? '<unparsed>'} ${matched ? '(confirmed)' : '(DID NOT MATCH — verify)'}`, { host: h.name, action, service, desired, actual, matched, privilege });
+    },
+  );
+
+  p.define(
+    'win_events_query',
+    'Bounded historical Windows event-log query over SSH PowerShell — "the last N System errors, now" — distinct from monitor_start/monitor_events, which only report NEW events after a baseline. levels: Critical=1, Error=2, Warning=3, Info=4, Verbose=5. The payload returns as base64-of-UTF8 (event Messages carry arbitrary unicode); empty output means genuinely zero matching events, while an undecodable payload is reported as REMOTE_ERROR — never quietly as zero events.',
+    {
+      host: z.string().optional(),
+      logName: z.string().default('System'),
+      levels: z.array(z.number().int().min(1).max(5)).default([1, 2, 3]),
+      count: z.number().int().min(1).max(200).default(20),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, logName, levels, count, timeoutMs }) => {
+      const h = p.requireHost(host);
+      requireWindows(h);
+      const res = await p.runChecked(h, 'win_events_query', eventQueryCommand(logName, levels, count), timeoutMs);
+      if (res.code !== 0) return toolError('REMOTE_ERROR', `win_events_query ${logName} on ${h.name} failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, logName, levels, count }, 'check the log name and that the sshd token may read the event log; retry, or run the raw Get-WinEvent via exec');
+      const events = decodeWinEventJson(res.stdout);
+      if (events === null) return toolError('REMOTE_ERROR', 'win_events_query: could not decode the event payload', { host: h.name, logName, levels, count, stdoutPreview: res.stdout.trim().slice(0, 200) }, 'the command may have failed (check the log name/permissions); retry, or run the raw Get-WinEvent via exec');
+      const n = events.length;
+      const lines = events.slice(0, 5).map((e) => {
+        const r = (e ?? {}) as Record<string, unknown>;
+        return `${String(r.TimeCreated ?? '?')} ${String(r.Id ?? '?')} L${String(r.Level ?? '?')} ${String(r.ProviderName ?? '?')}`;
+      });
+      return toolText(
+        `win_events_query ${logName} L${levels.join(',')} on ${h.name}: ${n} event(s)${lines.length ? '\n' + lines.join('\n') : ''}${n === count ? '\nnote: returned exactly the count cap — possibly truncated by the count cap — raise count (max 200)' : ''}`,
+        { host: h.name, logName, levels, count, returned: n, truncated: n >= count, events },
+      );
     },
   );
 
@@ -1205,12 +1359,16 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     'adb_status',
     'Probe the local adb CLI (Android Debug Bridge) and list connected devices with serial/state/model; honestly reports adb not installed as available=false rather than failing.',
     async () => {
+      const bin = adbBinInfo();
+      const binLabel = bin.source === 'path' ? 'adb (resolved via PATH)' : bin.bin;
       const probe = await adbAvailable();
-      if (!probe.available) return toolText(`adb unavailable: ${probe.error}`, { available: false, error: probe.error });
+      if (!probe.available) {
+        return toolText(`adb unavailable: ${probe.error}`, { available: false, error: probe.error, adbBinary: bin.bin, adbBinarySource: bin.source, probedPaths: bin.checked });
+      }
       const devices = await listDevices();
       return toolText(
-        `adb ${probe.version ?? 'unknown version'}; ${devices.length} device(s)` + (devices.length ? '\n' + devices.map((d) => `${d.serial} ${d.state}${d.model ? ' model=' + d.model : ''}`).join('\n') : ''),
-        { available: true, version: probe.version, devices },
+        `adb ${probe.version ?? 'unknown version'} (binary: ${binLabel}); ${devices.length} device(s)` + (devices.length ? '\n' + devices.map((d) => `${d.serial} ${d.state}${d.model ? ' model=' + d.model : ''}`).join('\n') : ''),
+        { available: true, version: probe.version, adbBinary: bin.bin, adbBinarySource: bin.source, probedPaths: bin.checked, devices },
       );
     },
   );
@@ -1225,6 +1383,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     },
     async ({ serial, command, timeoutMs }) => {
       const res = await adbExec(serial, command, timeoutMs);
+      if (res.missing) return toolError('CAPABILITY_UNAVAILABLE', `adb not installed: cannot run "${command}" on ${serial}`, { serial, command }, 'install Android platform-tools and put it on PATH, or set CONTROL_MCP_ADB_PATH to the adb binary; run adb_status to see which path control-mcp resolved');
       return toolText(`adb exec ${serial}: exit ${res.code ?? 'n/a'}`, { serial, command, ...res });
     },
   );
@@ -1302,6 +1461,35 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     async ({ serial, timeoutMs }) => {
       const r = await adminRoot(serial, timeoutMs);
       return toolText(`adb root ${serial}: ${r.ok ? 'ok' : 'refused'} -- ${r.output.slice(0, 300)}`, { serial, ok: r.ok, output: r.output });
+    },
+  );
+
+  p.define(
+    'adb_device_state',
+    'Compact health/power snapshot of a connected Android device: battery level/status/plugged/temperature (dumpsys battery), wakefulness + screen state + doze (dumpsys power), airplane mode and screen brightness/mode (settings), and free space on /data (df). Each read is independent: a field the dump did not yield is null (never guessed), and the sections that could not be read are listed as unavailable.',
+    { serial: z.string().min(1), timeoutMs: z.number().int().min(100).max(120000).default(15000) },
+    async ({ serial, timeoutMs }) => {
+      const s = await deviceState(serial, timeoutMs);
+      const parts: string[] = [];
+      const bat: string[] = [];
+      if (s.battery.status !== null) bat.push(s.battery.status);
+      if (s.battery.plugged !== null) bat.push(s.battery.plugged);
+      if (s.battery.temperatureC !== null) bat.push(`${s.battery.temperatureC}°C`);
+      if (s.battery.level !== null) parts.push(`battery ${s.battery.level}%${bat.length ? ` (${bat.join(', ')})` : ''}`);
+      else if (bat.length) parts.push(`battery ${bat.join(', ')}`);
+      const pw: string[] = [];
+      if (s.power.wakefulness !== null) pw.push(s.power.wakefulness);
+      if (s.power.screenOn !== null) pw.push(s.power.screenOn ? 'screenOn' : 'screenOff');
+      if (s.power.doze !== null) pw.push(`doze:${s.power.doze}`);
+      if (pw.length) parts.push(pw.join(', '));
+      if (s.airplaneModeOn !== null) parts.push(`airplane ${s.airplaneModeOn ? 'on' : 'off'}`);
+      const br: string[] = [];
+      if (s.screenBrightness !== null) br.push(`brightness ${s.screenBrightness}`);
+      if (s.screenBrightnessMode !== null) br.push(s.screenBrightnessMode === '1' ? 'auto' : s.screenBrightnessMode === '0' ? 'manual' : `mode:${s.screenBrightnessMode}`);
+      if (br.length) parts.push(br.join('/'));
+      if (s.dataFreeMb !== null) parts.push(`/data ${s.dataFreeMb >= 1024 ? `${(s.dataFreeMb / 1024).toFixed(1)} GB` : `${s.dataFreeMb} MB`} free`);
+      const failedNote = s.failed.length ? ` (unavailable: ${s.failed.join(', ')})` : '';
+      return toolText(`${serial} : ${parts.length ? parts.join(', ') : 'no state field could be read'}${failedNote}`, { ...s });
     },
   );
 

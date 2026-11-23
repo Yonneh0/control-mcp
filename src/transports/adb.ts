@@ -2,6 +2,12 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ControlError } from '../errors.js';
+import { resolveAdbBin, type AdbBinResolution } from './adbPath.js';
+
+// One shared hint for every adb-missing path, so an operator is told exactly how
+// to fix it rather than only that adb "is not installed".
+const ADB_INSTALL_HINT =
+  'install Android platform-tools and put it on PATH, or set CONTROL_MCP_ADB_PATH to the adb binary; run adb_status to see which path control-mcp resolved';
 
 export interface AdbDevice {
   serial: string;
@@ -22,6 +28,10 @@ interface AdbExecResult {
   signal: string | null;
   truncated: boolean;
   durationMs: number;
+  // True when the adb binary itself could not be spawned (ENOENT). Callers map
+  // this to CAPABILITY_UNAVAILABLE instead of reporting a null exit code, so a
+  // missing binary is never confused with a command that ran and failed.
+  missing?: boolean;
 }
 
 interface SpawnOut {
@@ -44,6 +54,24 @@ const STDOUT_CAP = 8 * 1024 * 1024;
 const STDERR_CAP = 1 * 1024 * 1024;
 // Grace after SIGTERM before escalating to SIGKILL and settling anyway.
 const KILL_GRACE_MS = 1000;
+
+// Resolved adb binary, cached after the first probe so we do not re-stat the
+// SDK on every call. Call sites pass the sentinel 'adb' as argv[0]; the two
+// spawn helpers below swap it for the resolved path. resolveAdbBin already
+// returns the bare 'adb' when nothing is found, so PATH resolution is preserved.
+let cachedAdbBin: AdbBinResolution | null = null;
+function adbBin(): AdbBinResolution {
+  if (!cachedAdbBin) cachedAdbBin = resolveAdbBin();
+  return cachedAdbBin;
+}
+// Exposed for adb_status: the concrete binary + how it was found + what was probed.
+export function adbBinInfo(): AdbBinResolution {
+  return adbBin();
+}
+// Test seam: force a re-resolve after changing env in a unit test.
+export function resetAdbBinCache(): void {
+  cachedAdbBin = null;
+}
 
 function asError(err: unknown): Error {
   if (err instanceof Error) return err;
@@ -72,7 +100,8 @@ function decodeText(bytes: Uint8Array): string {
 function spawnAdb(argv: string[], timeoutMs: number): Promise<{ out: SpawnOut; durationMs: number }> {
   const started = Date.now();
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
+    const cmd = argv[0] === 'adb' ? adbBin().bin : argv[0];
+    const child = spawn(cmd, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
     const chunksOut: Buffer[] = [];
     const chunksErr: Buffer[] = [];
     let stdoutLen = 0;
@@ -141,7 +170,7 @@ function spawnAdb(argv: string[], timeoutMs: number): Promise<{ out: SpawnOut; d
 
 function asAdbError(err: Error, op: string): ControlError {
   if (errCodeOf(err) === 'ENOENT') {
-    return new ControlError('CAPABILITY_UNAVAILABLE', `adb not installed: ${op}`, { op });
+    return new ControlError('CAPABILITY_UNAVAILABLE', `adb not installed: ${op}`, { op }, ADB_INSTALL_HINT);
   }
   if (isTimeoutError(err)) {
     return new ControlError('TIMEOUT', `${op} timed out`, { op });
@@ -162,6 +191,7 @@ function noExitCodeError(op: string, serial: string, out: SpawnOut): ControlErro
     missing ? 'CAPABILITY_UNAVAILABLE' : 'REMOTE_ERROR',
     `${op} did not complete: ${why || 'adb process died without an exit code'}`,
     { serial, op },
+    missing ? ADB_INSTALL_HINT : undefined,
   );
 }
 
@@ -222,6 +252,7 @@ export async function adbExec(
     signal: out.signal,
     truncated: out.truncated,
     durationMs,
+    missing: out.code === null && out.spawnErrorCode === 'ENOENT',
   };
 }
 
@@ -697,7 +728,8 @@ export async function listDir(serial: string, remotePath: string, timeoutMs = 15
 // unlike shell commands these never load a binary into memory.
 function spawnWait(argv: string[], timeoutMs: number): Promise<{ code: number | null; signal: string | null; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'] });
+    const cmd = argv[0] === 'adb' ? adbBin().bin : argv[0];
+    const child = spawn(cmd, argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderrLen = 0;
     let err = '';
     let timedOut = false;
@@ -1006,4 +1038,223 @@ export async function runUiPreset(serial: string, name: UiPreset, timeoutMs = 20
       };
     }
   }
+}
+
+// ---- device state snapshot (battery / power / settings / storage) ---------
+//
+// A compact health/power snapshot so the operator does not have to run several
+// `dumpsys` / `settings` reads by hand. Honesty rules as ever: every field is
+// either read from the device or null — a dumpsys format a parser does not
+// recognize yields null, never a guess. The sections are gathered independently
+// so one unreadable dump does not cost the other reads; sections whose read did
+// not complete are listed in `failed` with their fields left null.
+
+export interface BatteryState {
+  level: number | null;
+  status: string | null;
+  plugged: string | null;
+  temperatureC: number | null;
+}
+
+export interface PowerState {
+  wakefulness: string | null;
+  screenOn: boolean | null;
+  doze: string | null;
+}
+
+// BatteryManager.BATTERY_STATUS_* and BATTERY_PLUGGED_* codes.
+const BATTERY_STATUS: Record<number, string> = {
+  1: 'unknown',
+  2: 'charging',
+  3: 'discharging',
+  4: 'not-charging',
+  5: 'full',
+};
+const BATTERY_PLUGGED: Record<number, string> = {
+  0: 'none',
+  1: 'ac',
+  2: 'usb',
+  4: 'wireless',
+};
+
+// An exact `key: <integer>` line in a dumpsys battery block. The "AC powered:
+// true" style boolean lines are deliberately NOT mapped — they are redundant
+// with `plugged:` and treating them as it would be interpretation, not a read.
+function batteryNumber(out: string, key: string): number | null {
+  const m = new RegExp(`^[ \\t]*${key}:[ \\t]*(-?\\d+)[ \\t]*$`, 'm').exec(out);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+export function parseBatteryDump(out: string): BatteryState {
+  const rawLevel = batteryNumber(out, 'level');
+  // Clamp into the documented 0..100 range; out-of-range numbers are still
+  // clamped, a missing or non-numeric line is null, never an invented value.
+  const level = rawLevel === null ? null : Math.max(0, Math.min(100, rawLevel));
+  const rawStatus = batteryNumber(out, 'status');
+  // An unrecognized status code is surfaced verbatim as its number rather than
+  // folded into 'unknown', so the operator sees it is not a mapped value.
+  const status = rawStatus === null ? null : BATTERY_STATUS[rawStatus] ?? String(rawStatus);
+  const rawPlugged = batteryNumber(out, 'plugged');
+  const plugged = rawPlugged === null ? null : BATTERY_PLUGGED[rawPlugged] ?? 'other';
+  const rawTemp = batteryNumber(out, 'temperature');
+  // EXTRA_TEMPERATURE is in tenths of a degree Celsius.
+  const temperatureC = rawTemp === null ? null : rawTemp / 10;
+  return { level, status, plugged, temperatureC };
+}
+
+// Parse a `dumpsys power` block. Formats differ across OEM releases, so each
+// field is probed alone and stays null when the dump does not carry it.
+export function parsePowerDump(out: string): PowerState {
+  // The lookbehind keeps near-neighbours (mWakefulnessChanging,
+  // mQcomScreenOn) from matching the key we actually want.
+  const wake = /(?<![A-Za-z0-9_$])mWakefulness=(\S+)/.exec(out);
+  let screenOn: boolean | null = null;
+  const screenFlag = /(?<![A-Za-z0-9_$])mScreenOn=(true|false)/.exec(out);
+  const displayPower = /Display Power:\s*state=([A-Za-z]+)/.exec(out);
+  if (screenFlag) {
+    screenOn = screenFlag[1] === 'true';
+  } else if (displayPower) {
+    const v = displayPower[1].toUpperCase();
+    // Only ON/OFF is a boolean screen state; other values this field takes
+    // (DOZING, INTERACTIVE, DIM, …) are not mapped onto a guess.
+    if (v === 'ON') screenOn = true;
+    else if (v === 'OFF') screenOn = false;
+  }
+  const dozeLine = /^[ \t]*(?:Doze mode|Doze|mDozeState)[ \t]*[:=][ \t]*(\S.*)$/m.exec(out);
+  const doze = dozeLine ? dozeLine[1].replace(/[;{}].*$/, '').trim().slice(0, 60) || null : null;
+  return { wakefulness: wake ? wake[1] : null, screenOn, doze };
+}
+
+const DF_SUFFIX: Record<string, number> = {
+  K: 1024,
+  M: 1024 * 1024,
+  G: 1024 * 1024 * 1024,
+};
+
+// Parse `df /data` (toybox/busybox with a Mounted-on column): find the row
+// whose last column is exactly /data and convert its 4th column (Available) to
+// MB. Toybox df defaults to 1K-blocks, so an unsuffixed number means KiB;
+// suffixed values (human-readable df, e.g. "5.2G") are powers of 1024 bytes.
+// `dumpsys diskstats` would be an alternative source but its label wording
+// varies too much across OEMs to trust a regex against it, so df is the only
+// path here. No /data row, or an unparsable Available column, is null — not 0.
+export function parseDataFreeMb(out: string, assumeTarget = false): number | null {
+  const availOf = (tok: string): number | null => {
+    const m = /^(\d+(?:\.\d+)?)([KMG])?$/i.exec(tok);
+    if (!m) return null;
+    return Math.round(parseFloat(m[1]) * (m[2] ? DF_SUFFIX[m[2].toUpperCase()] : 1024) / 1e6);
+  };
+  let singleAvail: number | null = null; // Available of the (only) non-/data data row
+  let dataRows = 0;
+  for (const raw of out.split(/\r?\n/)) {
+    const cols = raw.trim().split(/\s+/).filter(Boolean);
+    // df row: Filesystem <size> <used> <available> <use%> <mounted-on>
+    if (cols.length < 6) continue;
+    const avail = availOf(cols[3]);
+    if (avail === null) continue; // header row or unparsable size → not a data row
+    dataRows++;
+    // An explicit /data mount wins outright.
+    if (cols[cols.length - 1] === '/data') return avail;
+    singleAvail = avail;
+  }
+  // No /data label. Only trust a lone row when the caller asked for a specific
+  // path (`df /data` prints the one filesystem that HOLDS /data, though its
+  // mount column may be labeled oddly — a real S21 reports it as a /storage/...
+  // path). Without assumeTarget a single non-/data row is just one filesystem in
+  // a full listing, so it is NOT treated as /data.
+  if (assumeTarget && dataRows === 1 && singleAvail !== null) return singleAvail;
+  return null;
+}
+
+export interface DeviceState {
+  serial: string;
+  battery: BatteryState;
+  power: PowerState;
+  airplaneModeOn: boolean | null;
+  screenBrightness: number | null;
+  screenBrightnessMode: string | null;
+  dataFreeMb: number | null;
+  // Section names ('battery','power','airplane','brightness','brightnessMode',
+  // 'data') whose read did not complete. The fields stay null because they were
+  // never observed, not because the device reported them absent.
+  failed: string[];
+  collectedAt: string;
+}
+
+export async function deviceState(serial: string, timeoutMs = 15000): Promise<DeviceState> {
+  serial = needSerial(serial);
+  const failed: string[] = [];
+  // Set if any adb shell probe could not spawn the binary at all (ENOENT): the
+  // whole snapshot is then pointless, so it is reported as a missing capability.
+  let adbMissing = false;
+  const state: DeviceState = {
+    serial,
+    battery: { level: null, status: null, plugged: null, temperatureC: null },
+    power: { wakefulness: null, screenOn: null, doze: null },
+    airplaneModeOn: null,
+    screenBrightness: null,
+    screenBrightnessMode: null,
+    dataFreeMb: null,
+    failed,
+    collectedAt: new Date().toISOString(),
+  };
+  // One probe per section, each guarded on its own: a dead dumpsys service or
+  // a missing settings key must not cost the operator the other reads. The
+  // probes run concurrently so the whole snapshot still fits inside timeoutMs.
+  // A non-zero exit counts as a failure (no usable dump), recorded in failed[].
+  const batteryProbe = adbExec(serial, 'dumpsys battery', timeoutMs)
+    .then((r) => {
+      if (r.missing) adbMissing = true;
+      if (r.code !== 0) throw new Error(`dumpsys battery exit ${r.code ?? 'no exit code'}`);
+      state.battery = parseBatteryDump(r.stdout);
+    })
+    .catch(() => {
+      failed.push('battery');
+    });
+  const powerProbe = adbExec(serial, 'dumpsys power', timeoutMs)
+    .then((r) => {
+      if (r.missing) adbMissing = true;
+      if (r.code !== 0) throw new Error(`dumpsys power exit ${r.code ?? 'no exit code'}`);
+      state.power = parsePowerDump(r.stdout);
+    })
+    .catch(() => {
+      failed.push('power');
+    });
+  const airplaneProbe = getSetting(serial, 'global', 'airplane_mode_on', timeoutMs)
+    .then((v) => {
+      if (v === '1') state.airplaneModeOn = true;
+      else if (v === '0') state.airplaneModeOn = false;
+      // null or an unexpected value: leave airplaneModeOn null — unset is not off.
+    })
+    .catch(() => {
+      failed.push('airplane');
+    });
+  const brightnessProbe = getSetting(serial, 'system', 'screen_brightness', timeoutMs)
+    .then((v) => {
+      if (v !== null && /^\d+$/.test(v)) state.screenBrightness = parseInt(v, 10);
+    })
+    .catch(() => {
+      failed.push('brightness');
+    });
+  const brightnessModeProbe = getSetting(serial, 'system', 'screen_brightness_mode', timeoutMs)
+    .then((v) => {
+      state.screenBrightnessMode = v;
+    })
+    .catch(() => {
+      failed.push('brightnessMode');
+    });
+  const dataProbe = adbExec(serial, 'df /data', timeoutMs)
+    .then((r) => {
+      if (r.missing) adbMissing = true;
+      if (r.code !== 0) throw new Error(`df /data exit ${r.code ?? 'no exit code'}`);
+      state.dataFreeMb = parseDataFreeMb(r.stdout, true);
+    })
+    .catch(() => {
+      failed.push('data');
+    });
+  await Promise.all([batteryProbe, powerProbe, airplaneProbe, brightnessProbe, brightnessModeProbe, dataProbe]);
+  if (adbMissing) {
+    throw new ControlError('CAPABILITY_UNAVAILABLE', 'adb not installed: cannot read device state', { serial }, ADB_INSTALL_HINT);
+  }
+  return state;
 }

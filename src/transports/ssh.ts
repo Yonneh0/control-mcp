@@ -55,7 +55,15 @@ function mapAuthError(err: Error): ControlError {
   if (/all configured authentication methods failed|no matching key|cannot parse key|Encrypted private/i.test(msg)) {
     return new ControlError('AUTH_FAILED', `SSH authentication failed: ${msg}`);
   }
-  if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ECONNRESET|Timed out while waiting for handshake/i.test(msg)) {
+  if (/ECONNREFUSED/i.test(msg)) {
+    return new ControlError(
+      'HOST_UNREACHABLE',
+      `SSH connection refused: ${msg} — the host answered on the network and rejected the connection, so it is UP but nothing is listening on the SSH port (the service is stopped, not started yet — e.g. seconds after boot — or bound elsewhere)`,
+      { reason: 'refused' },
+      'the box is reachable and powered on — do NOT wake it. Start the SSH service on the target (e.g. start sshd), or confirm the port; a connection-refused is different from a timeout (that one can mean down).',
+    );
+  }
+  if (/ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ECONNRESET|Timed out while waiting for handshake/i.test(msg)) {
     return new ControlError('HOST_UNREACHABLE', `SSH connection failed: ${msg}`);
   }
   return new ControlError('INTERNAL', `SSH error: ${msg}`);
