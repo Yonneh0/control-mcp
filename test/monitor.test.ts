@@ -37,7 +37,11 @@ function winRecordJson(rid: number, level: number, message: string): string {
 
 function winStdout(records: string[]): string {
   const json = records.length === 1 ? records[0] : `[${records.join(',')}]`;
-  return Buffer.from(json, 'utf16le').toString('base64');
+  // The command base64-encodes the JSON as UTF-8 (see WIN_PS_QUERY); this fixture
+  // mirrors that exactly so it is a regression test for the real contract, not
+  // for the decoder in isolation (a UTF-16 fixture here once hid a silent
+  // Windows capability failure).
+  return Buffer.from(json, 'utf8').toString('base64');
 }
 
 // Field names are the REAL journald -o json fields, verified live on um780

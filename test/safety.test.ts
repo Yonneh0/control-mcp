@@ -62,6 +62,17 @@ describe('checkCommand', () => {
     { why: 'taskkill with an image-name filter', cmd: 'taskkill /fi "imagename eq sshd.exe"', ctx: WINDOWS_SSH },
     { why: 'sc.exe (explicit image) stopping the daemon', cmd: 'sc.exe stop sshd', ctx: WINDOWS_SSH },
     { why: 'systemctl kill signals the daemon unit', cmd: 'systemctl kill sshd', ctx: LINUX_SSH },
+    { why: 'pwsh (not just powershell) with -Command', cmd: 'pwsh -Command "Stop-Service sshd"', ctx: WINDOWS_SSH },
+    { why: 'the -c abbreviation of -Command', cmd: 'powershell -c "net stop sshd"', ctx: WINDOWS_SSH },
+    { why: 'a bash -c wrapper must not hide the unit', cmd: 'bash -c "systemctl stop sshd"', ctx: LINUX_SSH },
+    { why: 'sudo with a -u <user> value does not dodge the unit', cmd: 'sudo -u root systemctl stop sshd', ctx: LINUX_SSH },
+    { why: 'a pipeline whose source names the service feeds a nameless stop sink', cmd: 'Get-Service sshd | Stop-Service', ctx: WINDOWS_SSH },
+    { why: 'the process-stop pipeline sink', cmd: 'Get-Process sshd | Stop-Process', ctx: WINDOWS_SSH },
+    { why: 'pkill -f matches the daemon by its command line', cmd: 'pkill -f sshd', ctx: LINUX_SSH },
+    { why: 'masking the unit leaves it unable to start at boot', cmd: 'systemctl mask sshd', ctx: LINUX_SSH },
+    { why: 'net.exe is the same controller as net', cmd: 'net.exe stop sshd', ctx: WINDOWS_SSH },
+    { why: 'a base64 -EncodedCommand is decoded and screened too', cmd: 'powershell -NoProfile -EncodedCommand ' + Buffer.from('Stop-Service sshd', 'utf16le').toString('base64'), ctx: WINDOWS_SSH },
+    { why: 'an undecodable -EncodedCommand is refused (fail closed)', cmd: 'powershell -NoProfile -EncodedCommand ' + Buffer.from([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0]).toString('base64'), ctx: WINDOWS_SSH },
   ];
 
   it.each(SEVERING)('$why: refuses $cmd with TRANSPORT_SEVERED_RISK', (row) => {
@@ -100,6 +111,8 @@ describe('checkCommand', () => {
     { why: 'the linux guard only applies to the transport we are using', cmd: 'systemctl stop sshd', ctx: LINUX_RDP },
     { why: 'the operator opted out of the guard', cmd: 'Stop-Service sshd', ctx: WINDOWS_PERMITTING },
     { why: 'the operator opted out of the guard', cmd: 'sc delete sshd', ctx: WINDOWS_PERMITTING },
+    { why: 'a benign -EncodedCommand decodes and passes', cmd: 'powershell -NoProfile -EncodedCommand ' + Buffer.from('Get-Process | Select-Object Name', 'utf16le').toString('base64'), ctx: WINDOWS_SSH },
+    { why: 'a nameless stop sink is allowed when nothing names the transport service', cmd: 'Get-Process chrome | Stop-Process', ctx: WINDOWS_SSH },
   ];
 
   it.each(HARMLESS)('$why: allows $cmd', (row) => {

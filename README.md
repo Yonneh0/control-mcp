@@ -52,7 +52,7 @@ Nothing is asserted that was not observed:
   `net_probe_tcp`, `wol_wake`, `arp_table`, `cdp_discover`) and the adb tools keep
   working with no config at all.
 
-## Tools (54)
+## Tools (59)
 
 **Host discovery**
 - `host_list` — configured hosts (name, address, os, alternate addresses, declared
@@ -83,6 +83,33 @@ Nothing is asserted that was not observed:
   remote failure.
 - `file_list` — name, size, type (from the mode bits), mode, mtime; capped to 500
   entries per call with the total reported.
+
+**File management** (over SSH/SFTP; the read/write family that `exec` can do
+clumsily)
+- `file_glob` — files by name under a directory, newest-first, bounded by
+  `maxResults`. The glob dialect differs by OS and is not interchangeable: GNU
+  `find -path` on Linux (where `**` behaves like `*`, because `-path` matches the
+  whole path and `*` spans `/`), PowerShell `-like` (`* ? [ ]`) on Windows. A
+  capped answer says so, and says whether more matches may exist (Windows caps in
+  the remote query; Linux counts what arrived, unless the transport's 2 MiB output
+  ceiling truncated it).
+- `file_search` — content matches as `path:line:text`. Same caveat, louder: the
+  regex dialect is POSIX ERE (`grep -E`) on Linux and .NET (`Select-String`) on
+  Windows. `grep`'s exit 1 means "no matches", so it is reported as
+  success-with-no-results, never as a failure; binary files are skipped.
+- `file_read` — a bounded window of numbered lines under a header giving the
+  window and the real line count. A file larger than `maxBytes` is read truncated
+  and the header says so; a NUL byte in the first 8 KiB is refused in favour of
+  `file_download` rather than shown as mojibake.
+- `file_write` — write or append UTF-8 text and report the byte count. Refuses to
+  clobber: an existing destination needs `overwrite: true` (and a directory target
+  is refused), the same guard `file_upload` applies.
+- `file_patch` — targeted string edits, all validated against a working copy
+  before anything is written: an `oldString` that matches 0 or several times
+  refuses the **whole** patch, so no edit ever lands half-applied. A file it
+  cannot read whole (>8 MiB) is refused rather than rewritten from a truncated
+  read, and the result states that read-modify-write is not atomic — a concurrent
+  editor's work can be lost.
 
 **Local networking** (no host config needed)
 - `net_ping` — reachability; requires an actual reply line, because `ping.exe`
@@ -171,9 +198,10 @@ pixels.
 
 ```
 src/index.ts            stdio MCP server (stdout is JSON-RPC only; stderr is the log)
-src/tools/registry.ts   the 54 tools + the audited pipeline: zod -> safety gate -> transport
+src/tools/registry.ts   the 59 tools + the audited pipeline: zod -> safety gate -> transport
 src/config/             TOML config: schema (zod, .strict()), loader, secret resolution
 src/transports/ssh.ts       ssh2 exec, persistent shell sessions (in-band sentinel), SFTP streaming
+src/transports/fileops.ts   pure file-management builders/parsers (find+grep, PowerShell, patch) — no transport
 src/transports/netprobe.ts  ping / TCP probe / ARP / Wake-on-LAN / CDP raw-frame listener / RDP policy probe
 src/transports/monitor.ts   event monitors: Windows Event Log + journald polling, per-host queues
 src/transports/winsnapshot.ts PrintWindow -> PNG (koffi FFI: user32 + gdi32, hand-built PNG)
@@ -468,6 +496,12 @@ quotes a POSIX remote path with POSIX escaping, so `/tmp/$(reboot)` is matched a
 literal filename rather than executed (SFTP paths never go through a shell at all); a
 destination that cannot be pre-checked is not claimed absent — the transfer proceeds
 and the failure to check is logged.
+
+`file_glob` and `file_search` pass the caller's pattern, root and include through
+the same POSIX escaping (and through `-EncodedCommand` on Windows), so a pattern
+like `a'; rm -rf /; echo '` is matched as a literal and never executed; the only
+value interpolated into a command line is `maxResults`, validated to an integer
+before it gets there.
 
 ## Monitor
 

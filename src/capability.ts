@@ -80,7 +80,11 @@ export function classifyRdp(input: RdpProbeInput): RdpVerdict {
       evidence,
     };
   }
-  return { available: true, reason: 'RDP listener open and a usable credential path exists.' };
+  const cred =
+    input.hasCredential === true
+      ? 'a credential path is configured (cmdkey / passwordEnv / credentialTarget) — not verified end-to-end over the network'
+      : 'credential not verified — this is a network/availability verdict only';
+  return { available: true, reason: `RDP listener open; ${cred}.` };
 }
 
 export interface InterfacePick {

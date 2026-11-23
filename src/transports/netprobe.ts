@@ -49,8 +49,8 @@ export function probeTcp(address: string, port: number, timeoutMs = 2000): Promi
   });
 }
 
-async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTransport): Promise<{ blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean }> {
-  const out: { blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean } = {};
+async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTransport): Promise<{ blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string }> {
+  const out: { blankPasswordAccount?: boolean; limitBlankPasswordUse?: number; nlaRequired?: boolean; netuseCode?: string; netuseErr?: string } = {};
   // UserAuthentication is the NLA switch (1 = require NLA); SecurityLayer is a
   // different value and would misreport. The blank-password probe targets the
   // account RDP would actually use: rdp.user when configured, otherwise it is
@@ -75,10 +75,12 @@ async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTrans
     `$ProgressPreference='SilentlyContinue'`,
     `$lbp=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa').LimitBlankPasswordUse`,
     `$nla=(Get-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp').UserAuthentication`,
-    `cmd /c net use \\\\${address}\\IPC$ "" /user:${probeUser} 2>&1 | Out-Null`,
+    `$o = cmd /c net use \\\\${address}\\IPC$ "" /user:${probeUser} 2>&1`,
     `$code=$LASTEXITCODE`,
     `net use \\\\${address}\\IPC$ /delete 2>&1 | Out-Null`,
-    `Write-Output "lbp=$lbp nla=$nla netuse=$code"`,
+    `$m = ($o | Out-String)`,
+    `$ec=''; if($m -match 'System error (\\d+)'){$ec=$Matches[1]}`,
+    `Write-Output "lbp=$lbp nla=$nla netuse=$code err=$ec"`,
   ].join('; ');
   const b64 = Buffer.from(ps, 'utf16le').toString('base64');
   try {
@@ -87,13 +89,18 @@ async function windowsRdpPolicy(host: HostConfig, address: string, ssh: SshTrans
     const lbp = /lbp=(\d+)/.exec(line);
     const nla = /nla=(\d+)/.exec(line);
     const nu = /netuse=(-?\d+)/.exec(line);
+    const ec = /err=(\d+)/.exec(line);
     if (lbp) out.limitBlankPasswordUse = Number(lbp[1]);
     if (nla) out.nlaRequired = nla[1] === '1';
-    // Refusal proof: exit 2 is the documented blank-password rejection (1327) —
-    // measured live on n100. Other nonzero codes are ambiguous (a wrong non-blank
-    // password also fails), so they do not assert blankPasswordAccount; the
-    // nla-credential-missing branch still covers those honestly.
-    if (nu && nu[1] === '2') out.blankPasswordAccount = true;
+    if (nu) out.netuseCode = nu[1];
+    if (ec) out.netuseErr = ec[1];
+    // Only System error 1327 ("blank passwords aren't allowed") proves the
+    // blank-password rejection. cmd's exit code alone is NOT enough: a wrong
+    // NON-blank password also exits 2 (error 1326), so the code must not be
+    // reported as "the account is blank". The error number decides.
+    if (ec && ec[1] === '1327') out.blankPasswordAccount = true;
+    else if (ec) out.blankPasswordAccount = false;
+    else if (nu && nu[1] === '0') out.blankPasswordAccount = false; // blank network logon actually succeeded
   } catch {
     /* best effort */
   }
@@ -294,7 +301,7 @@ function parseArpLinux(text: string): ArpEntry[] {
 export async function localArpTable(): Promise<ArpEntry[]> {
   const isWin = platform() === 'win32';
   try {
-    const { stdout } = await execFileP(isWin ? 'arp.exe' : 'arp', isWin ? ['-a'] : ['-an']);
+    const { stdout } = await execFileP(isWin ? 'arp.exe' : 'arp', isWin ? ['-a'] : ['-an'], { timeout: 8000 });
     return isWin ? parseArpWindows(stdout) : parseArpLinux(stdout);
   } catch {
     return [];
@@ -318,6 +325,13 @@ export async function listenCdpWindows(ifaceIndex: number, timeoutMs = 5000): Pr
     child.stdout.on('data', (d) => { if (out.length < 1024 * 1024) out += d.toString(); });
     child.stderr.on('data', (d) => { errTail = (errTail + d.toString()).slice(-2000); });
     const t = setTimeout(() => child.kill(), timeoutMs + 5000);
+    // A spawn failure (powershell missing, EACCES) emits 'error' on the event
+    // loop, OUTSIDE any promise chain — with no listener that is an uncaught
+    // exception that takes down the whole MCP server. Resolve null instead.
+    child.on('error', () => {
+      clearTimeout(t);
+      resolve(null);
+    });
     child.on('close', (code) => {
       clearTimeout(t);
       const trimmed = out.trim();

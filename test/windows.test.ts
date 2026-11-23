@@ -39,6 +39,12 @@ describe('extractJson', () => {
   it('returns null when nothing parses', () => {
     expect(extractJson('no json here')).toBeNull();
   });
+  it('parses a valid payload followed by trailing text (the bracket-balance fix)', () => {
+    // The old code JSON.parsed the whole tail, so a status line after the JSON
+    // made an otherwise-valid payload fail. These fail before / pass after.
+    expect(extractJson('{"ok":true}\nDONE')).toEqual({ ok: true });
+    expect(extractJson('warn: thing [x]\n{"a":[1,2]} tail')).toEqual({ a: [1, 2] });
+  });
 });
 
 describe('firewall command builders', () => {

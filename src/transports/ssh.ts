@@ -26,6 +26,12 @@ export interface ShellSession {
   buffer: string;
   pending: Array<{ resolve: (v: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>;
   closed: boolean;
+  /** Set once a command times out. The timed-out command's sentinel can still
+   *  arrive and be matched by the NEXT command, so a desynced session refuses
+   *  further commands instead of reporting another command's output/exit. */
+  desynced?: boolean;
+  /** True when the shell buffer was head-dropped over the capture cap. */
+  droppedFromBuffer?: boolean;
 }
 
 export interface TransferProgress {
@@ -190,11 +196,16 @@ export class SshTransport {
         let timedOut = false;
         let exitCode: number | null | undefined;
         let exitSignal: string | null | undefined;
+        let timer: ReturnType<typeof setTimeout> | undefined;
         channel.on('exit', (c?: number | null, s?: string | null) => {
+          // Process finished: cancel the deadline so a command that exits right
+          // around the timeout keeps its real exit code instead of being
+          // reported as timed out with the code discarded.
+          if (timer) clearTimeout(timer);
           exitCode = c ?? null;
           exitSignal = s ?? null;
         });
-        const timer = setTimeout(() => {
+        timer = setTimeout(() => {
           // Ask the remote side (via the channel signal extension) to terminate,
           // then hard-close. Whether the server honored TERM can only be observed
           // through the exit/close signal field, so we never assert delivery here.
@@ -219,10 +230,19 @@ export class SshTransport {
           errLen += d.length;
           if (errLen > MAX_OUTPUT_BYTES) truncated = true;
         });
+        // Decode to a UTF-8 boundary so the byte cap never leaves a lone
+        // replacement char from a split multibyte sequence.
+        const decodeCap = (chunks: Buffer[]): string => {
+          const buf = Buffer.concat(chunks);
+          if (buf.length <= MAX_OUTPUT_BYTES) return buf.toString('utf8');
+          let end = MAX_OUTPUT_BYTES;
+          while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+          return buf.subarray(0, end).toString('utf8');
+        };
         channel.on('close', (code?: number | null, signal?: string | null) => {
           clearTimeout(timer);
-          const out = Buffer.concat(outChunks).subarray(0, MAX_OUTPUT_BYTES).toString('utf8');
-          const errText = Buffer.concat(errChunks).subarray(0, MAX_OUTPUT_BYTES).toString('utf8');
+          const out = decodeCap(outChunks);
+          const errText = decodeCap(errChunks);
           // ssh2 emits 'close' on a clean exit WITHOUT an exit-status payload in
           // some server paths; 'exit' always fires before the final 'close'. The
           // last observed code wins so a real nonzero exit is never reported 0.
@@ -300,7 +320,12 @@ export class SshTransport {
 
   private onShellData(session: ShellSession, text: string) {
     session.buffer += text;
-    if (session.buffer.length > MAX_OUTPUT_BYTES) session.buffer = session.buffer.slice(-MAX_OUTPUT_BYTES);
+    if (session.buffer.length > MAX_OUTPUT_BYTES) {
+      // Head-drop: the earliest bytes are lost. Mark it so the tail is not
+      // presented to the caller as the command's complete output.
+      session.buffer = session.buffer.slice(-MAX_OUTPUT_BYTES);
+      session.droppedFromBuffer = true;
+    }
     // Resolve only when a FULL sentinel line has arrived: the shell echoes our
     // own command back (with \r), so require the copy that starts on its own
     // line and ends with "<digits>\n" — an echoed fragment like '%s\n' never
@@ -321,7 +346,11 @@ export class SshTransport {
     session.buffer = '';
     waiters.splice(0, waiters.length).forEach((w) => {
       clearTimeout(w.timer);
-      w.resolve(output + `\n[exit ${m[1]}]`);
+      const note = session.droppedFromBuffer
+        ? '\n[output exceeded the 2 MiB capture cap; earlier bytes were dropped]'
+        : '';
+      session.droppedFromBuffer = false;
+      w.resolve(output + `\n[exit ${m[1]}]` + note);
     });
   }
 
@@ -331,6 +360,10 @@ export class SshTransport {
       const timer = setTimeout(() => {
         const idx = session.pending.findIndex((p) => p.timer === timer);
         if (idx >= 0) session.pending.splice(idx, 1);
+        // The command may still be running and its sentinel will arrive later;
+        // that stale marker would otherwise be matched by the NEXT command.
+        // Mark the session desynced so runInShell refuses to keep using it.
+        session.desynced = true;
         const out = session.buffer;
         session.buffer = '';
         resolve(out + '\n[timeout: sentinel not seen; command may still be running]');
@@ -343,10 +376,13 @@ export class SshTransport {
     });
   }
 
-  async runInShell(sessionId: string, command: string, timeoutMs = 30000): Promise<{ output: string; closed: boolean }> {
+  async runInShell(sessionId: string, command: string, timeoutMs = 30000): Promise<{ output: string; closed: boolean; timedOut: boolean }> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new ControlError('SESSION_GONE', `No such shell session: ${sessionId}`);
     if (session.closed) throw new ControlError('SESSION_GONE', `Shell session ${sessionId} is closed`);
+    if (session.desynced) {
+      throw new ControlError('SESSION_GONE', `Shell session ${sessionId} is desynchronized after a timed-out command; its output and exit code can no longer be attributed. Close and open a new session.`);
+    }
     if (session.pending.length > 0) {
       throw new ControlError('BAD_ARGS', `Shell session ${sessionId} still has a command in flight; wait for it or close the session`);
     }
@@ -360,7 +396,9 @@ export class SshTransport {
     const wrapped = `${command}\n{ printf '\\n${sentinel}%s\\n' "$?" 2>/dev/null || echo ${sentinel}?; } 2>/dev/null\n`;
     session.channel.write(wrapped);
     const output = await this.waitPrompt(session, timeoutMs);
-    return { output, closed: session.closed };
+    // desynced is set only by the timeout branch (across this await), and entry
+    // refused a pre-desynced session, so here it is exactly "this call timed out".
+    return { output, closed: session.closed, timedOut: Boolean(session.desynced) };
   }
 
   getSession(id: string): ShellSession | undefined {
@@ -404,20 +442,27 @@ export class SshTransport {
     localPath: string,
     remotePath: string,
     onProgress?: (p: TransferProgress) => void,
-  ): Promise<{ bytes: number }> {
+  ): Promise<{ bytes: number; remoteBytes: number | null; verified: boolean }> {
     const sftp = await this.getSftp(host, address);
     const resolved = expandPath(localPath);
+    let remoteBytes: number | null = null;
     try {
       // fastPut streams from disk; do not also readFileSync the whole file.
       await new Promise<void>((resolve, reject) => {
         sftp.fastPut(resolved, remotePath, (err) => (err ? reject(new ControlError('REMOTE_ERROR', `SFTP upload failed: ${err.message}`, { code: (err as { code?: number }).code })) : resolve()));
       });
+      // Measure the size that actually landed; a local statSync proves nothing
+      // about the remote side (full filesystem, quota, partial write).
+      remoteBytes = await new Promise<number | null>((resolve) => {
+        sftp.stat(remotePath, (err, st) => resolve(err ? null : Number(st.size)));
+      });
     } finally {
       sftp.end();
     }
     const bytes = statSync(resolved).size;
+    const verified = remoteBytes !== null && remoteBytes === bytes;
     onProgress?.({ bytes, total: bytes });
-    return { bytes };
+    return { bytes, remoteBytes, verified };
   }
 
   async downloadFile(
@@ -425,19 +470,26 @@ export class SshTransport {
     address: string,
     remotePath: string,
     localPath: string,
-  ): Promise<{ bytes: number }> {
+  ): Promise<{ bytes: number; remoteBytes: number | null; verified: boolean }> {
     const sftp = await this.getSftp(host, address);
     const resolved = expandPath(localPath);
+    let remoteBytes: number | null = null;
     try {
       await new Promise<void>((resolve, reject) => {
         sftp.fastGet(remotePath, resolved, (err) =>
           err ? reject(new ControlError('REMOTE_ERROR', `SFTP download failed: ${err.message}`, { code: (err as { code?: number }).code })) : resolve(),
         );
       });
+      // The remote source size, so callers can compare against the local file
+      // that was written rather than trusting one side alone.
+      remoteBytes = await new Promise<number | null>((resolve) => {
+        sftp.stat(remotePath, (err, st) => resolve(err ? null : Number(st.size)));
+      });
     } finally {
       sftp.end();
     }
-    return { bytes: statSync(resolved).size };
+    const bytes = statSync(resolved).size;
+    return { bytes, remoteBytes, verified: remoteBytes !== null && remoteBytes === bytes };
   }
 
   async listDir(host: HostConfig, address: string, remotePath: string): Promise<Array<{ name: string; size: number; type: string; mode: number; mtime: number }>> {
@@ -458,6 +510,119 @@ export class SshTransport {
           : kind === 0x1000 ? 'fifo' : kind === 0x2000 ? 'char' : kind === 0x6000 ? 'block'
           : kind === 0xc000 ? 'socket' : 'other';
         return { name: e.filename, size: Number(e.attrs.size ?? 0), type, mode, mtime: Number(e.attrs.mtime ?? 0) * 1000 };
+      });
+    } finally {
+      sftp.end();
+    }
+  }
+
+  // Bounded remote read over SFTP: streams and stops once maxBytes is exceeded,
+  // so reading a very large file never loads it all into memory. ENOENT maps to
+  // BAD_ARGS (a missing file / directory is an argument problem, not a remote
+  // fault); anything else stays REMOTE_ERROR.
+  async readRemoteFile(
+    host: HostConfig,
+    address: string,
+    remotePath: string,
+    opts: { maxBytes: number },
+  ): Promise<{ buffer: Buffer; truncated: boolean; size: number }> {
+    const sftp = await this.getSftp(host, address);
+    try {
+      return await new Promise<{ buffer: Buffer; truncated: boolean; size: number }>((resolve, reject) => {
+        const rs = sftp.createReadStream(remotePath);
+        const chunks: Buffer[] = [];
+        let len = 0;
+        let overflow = false;
+        let settled = false;
+        rs.on('data', (d: Buffer) => {
+          if (overflow) return;
+          chunks.push(d);
+          len += d.length;
+          if (len > opts.maxBytes) {
+            overflow = true;
+            settled = true;
+            try {
+              rs.destroy();
+            } catch {
+              /* already closing */
+            }
+            resolve({ buffer: Buffer.concat(chunks, len).subarray(0, opts.maxBytes), truncated: true, size: len });
+          }
+        });
+        rs.on('end', () => {
+          if (!settled) {
+            settled = true;
+            resolve({ buffer: Buffer.concat(chunks, len), truncated: false, size: len });
+          }
+        });
+        rs.on('error', (err: Error) => {
+          if (settled) return;
+          settled = true;
+          const code = (err as { code?: number }).code;
+          if (code === 2 || /no such file|enoent|not exist|is a directory/i.test(err.message)) {
+            reject(new ControlError('BAD_ARGS', `No such remote file to read: ${remotePath}`, { remotePath }, 'confirm the path with file_list — a missing file or a directory cannot be read'));
+          } else {
+            reject(new ControlError('REMOTE_ERROR', `SFTP read failed: ${err.message}`, { code }));
+          }
+        });
+      });
+    } finally {
+      sftp.end();
+    }
+  }
+
+  async writeRemoteFile(
+    host: HostConfig,
+    address: string,
+    remotePath: string,
+    content: Buffer,
+    opts: { append: boolean },
+  ): Promise<{ bytes: number }> {
+    const sftp = await this.getSftp(host, address);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ws = sftp.createWriteStream(remotePath, { flags: opts.append ? 'a' : 'w' });
+        let settled = false;
+        const done = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        ws.on('close', done);
+        ws.on('finish', done);
+        ws.on('error', (err: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(new ControlError('REMOTE_ERROR', `SFTP write failed: ${err.message}`, { code: (err as { code?: number }).code }));
+        });
+        ws.end(content);
+      });
+      return { bytes: content.length };
+    } finally {
+      sftp.end();
+    }
+  }
+
+  // stat with an honest null for "no such file" so callers can guard overwrites
+  // without treating a missing file as an error.
+  async statRemote(
+    host: HostConfig,
+    address: string,
+    remotePath: string,
+  ): Promise<{ size: number; mtime: number; isDirectory: boolean } | null> {
+    const sftp = await this.getSftp(host, address);
+    try {
+      return await new Promise((resolve, reject) => {
+        sftp.stat(remotePath, (err, st) => {
+          if (err) {
+            const code = (err as { code?: number }).code;
+            if (code === 2 || /no such file|enoent|not exist/i.test(err.message)) return resolve(null);
+            return reject(new ControlError('REMOTE_ERROR', `SFTP stat failed: ${err.message}`, { code }));
+          }
+          const mode = Number(st?.mode ?? 0);
+          resolve({ size: Number(st?.size ?? 0), mtime: Number(st?.mtime ?? 0) * 1000, isDirectory: (mode & 0xf000) === 0x4000 });
+        });
       });
     } finally {
       sftp.end();

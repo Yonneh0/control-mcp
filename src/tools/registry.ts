@@ -10,12 +10,13 @@ import { pickInterface } from '../capability.js';
 import { SshTransport, type ExecResult } from '../transports/ssh.js';
 import { localArpTable, localInfo, listenCdpWindows, ping, probeHost, probeTcp, sendWake, type CdpNeighbor } from '../transports/netprobe.js';
 import { CLSID_MsRdpClientNotSafeForScripting, DLL_PATH_DEFAULT, IID_IMsRdpExInstance, createInstanceViaFactory, failed, guidBuffer, hr, loadMsRdpEx, loadOle32, wrapCom, type ComObject } from '../transports/msrdpex.js';
-import { findAllWindows, findWindow, hotkey, keyPress, mouseClick, typeText, VK } from '../transports/wininput.js';
+import { findAllWindows, hotkey, keyPress, mouseClick, typeText, VK } from '../transports/wininput.js';
 import { captureWindowPng } from '../transports/winsnapshot.js';
 import { EventMonitor, describeEventSinkPolicy, type SystemEvent } from '../transports/monitor.js';
 import { adminRoot, adbAvailable, adbExec, currentApp, dumpUi, findUiNodes, getSetting, inputKey, inputSwipe, inputTap, inputText, knownKeyNames, launchApp, listApps, listDevices, listDir, mediaControl, nowPlaying, openUrl, putSetting, pullFile, pushFile, recordScreen, resolveKeyCode, runUiPreset, screencapPng, setTextField, UI_PRESETS } from '../transports/adb.js';
 import type { AppsScope, SettingsNs, UiNode, UiPreset, UiTarget } from '../transports/adb.js';
 import { defenderRealtimeSetCommand, defenderSignatureUpdateCommand, defenderStatusCommand, extractJson, firewallAddRuleCommand, firewallRemoveRuleCommand, firewallSetProfileCommand, firewallStatusCommand, updateStatusCommand, updateTriggerCommand } from '../transports/windows.js';
+import { applyPatch, buildGlobCommand, buildSearchCommand, looksBinary, parseFindOutput, parseGrepOutput, parseWinGlobOutput, parseWinSearchOutput, sliceLines } from '../transports/fileops.js';
 import { join, win32 } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -417,7 +418,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const h = p.requireHost(host);
       const res = await p.runChecked(h, 'exec', command, timeoutMs, override);
       return toolText(
-        `exec ${h.name}: ${exitLabel(res)}${res.truncated ? ' [output truncated; full data in structuredContent]' : ''}${outputPreview(res)}`,
+        `exec ${h.name}: ${exitLabel(res)}${res.truncated ? ' [output truncated at the 2 MiB transport cap — the remaining bytes were dropped and are NOT available elsewhere in this result; re-run piping to e.g. "tail -c 2097152" or redirect to a file]' : ''}${outputPreview(res)}`,
         { host: h.name, address: h.address, command, stdout: res.stdout, stderr: res.stderr, exitCode: res.code, signal: res.signal, truncated: res.truncated, timedOut: res.timedOut, durationMs: res.durationMs },
       );
     },
@@ -439,7 +440,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const privilege = await measurePrivilege((hh, tt, cc, mm) => p.runChecked(hh, tt, cc, mm), h);
       const res = await p.runChecked(h, 'admin_exec', command, timeoutMs, override);
       return toolText(
-        `admin_exec ${h.name}: ${exitLabel(res)} [effective privilege: ${privilege}]${res.truncated ? ' [output truncated; full data in structuredContent]' : ''}${outputPreview(res)}`,
+        `admin_exec ${h.name}: ${exitLabel(res)} [effective privilege: ${privilege}]${res.truncated ? ' [output truncated at the 2 MiB transport cap — the remaining bytes were dropped and are NOT available elsewhere in this result; re-run piping to e.g. "tail -c 2097152" or redirect to a file]' : ''}${outputPreview(res)}`,
         { host: h.name, address: h.address, command, privilege, stdout: res.stdout, stderr: res.stderr, exitCode: res.code, signal: res.signal, truncated: res.truncated, timedOut: res.timedOut, durationMs: res.durationMs },
       );
     },
@@ -493,6 +494,16 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       if (res.code !== 0) {
         return toolError('REMOTE_ERROR', `firewall ${action} failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — check the arguments' : 'this mutation needs an elevated sshd token; a standard-integrity token cannot change the firewall, and the read-back above shows the unchanged state');
       }
+      if (action === 'remove_rule') {
+        const rb = res.stdout.trim();
+        // The builder emits REMOVED or STILL_PRESENT. A zero exit with the rule
+        // still present is NOT a success — report it as failed, not success-shaped.
+        const removed = /REMOVED/.test(rb) && !/STILL_PRESENT/.test(rb);
+        if (!removed) {
+          return toolError('REMOTE_ERROR', `firewall remove_rule "${ruleName}" on ${h.name}: the rule is still present after Remove-NetFirewallRule (read-back: ${rb.slice(0, 120) || 'empty'})`, { host: h.name, action, removed: false, privilege }, 'the rule may live under a different DisplayName than the one matched, or the token could not delete it (a non-elevated token cannot); inspect win_firewall status first');
+        }
+        return toolText(`win_firewall remove_rule "${ruleName}" on ${h.name} [privilege: ${privilege}]: removed (verified absent)`, { host: h.name, action, removed: true, privilege });
+      }
       return toolText(`win_firewall ${action} on ${h.name} [privilege: ${privilege}]; read-back: ${readBack}`, { host: h.name, action, privilege, result: extractJson(res.stdout), readBack });
     },
   );
@@ -527,8 +538,17 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
         return toolError('REMOTE_ERROR', `defender ${action} failed: ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — check the arguments' : 'this mutation needs an elevated sshd token');
       }
       if (action === 'realtime_set') {
-        const actual = readBack.toLowerCase() === 'true';
-        return toolText(`win_defender realtime_set ${desired} on ${h.name} [privilege: ${privilege}]; read-back RealTimeProtectionEnabled=${actual}${actual === desired ? ' (matched)' : ' (DID NOT MATCH)'}`, { host: h.name, action, desired, actual, matched: actual === desired, privilege });
+        // Only a literal true/false read-back proves the state. Coercing empty
+        // or garbage to `false` would falsely "match" an on:false request and
+        // report protection off when nothing was actually read.
+        const raw = readBack.trim().toLowerCase();
+        const actual = raw === 'true' ? true : raw === 'false' ? false : null;
+        const matched = actual === null ? null : actual === desired;
+        const outcome =
+          matched === true ? ' (matched)' :
+          matched === false ? ' (DID NOT MATCH)' :
+          ' (read-back was not a boolean; the protection state is NOT verified)';
+        return toolText(`win_defender realtime_set ${desired} on ${h.name} [privilege: ${privilege}]; read-back RealTimeProtectionEnabled=${readBack || '<empty>'}${outcome}`, { host: h.name, action, desired, actual, matched, readBack, privilege });
       }
       return toolText(`win_defender signature_update on ${h.name} [privilege: ${privilege}]; new AV signature: ${readBack}`, { host: h.name, action, signatureVersion: readBack, privilege });
     },
@@ -554,9 +574,18 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       }
       const res = await p.runChecked(h, 'win_update', updateTriggerCommand(action), timeoutMs);
       const privilege = await winPriv(h);
+      if (res.code !== 0) {
+        return toolError('REMOTE_ERROR', `win_update ${action}: the command failed (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`, { host: h.name, action, privilege }, privilege.includes('elevated') ? 'the token is elevated — usoclient may still have failed to start the session; check win_update status' : 'this trigger needs the elevated sshd token');
+      }
       const m = /USO_EXIT=(-?\d+)/.exec(res.stdout);
-      const exitTok = m ? m[1] : 'n/a';
-      return toolText(`win_update ${action} triggered on ${h.name} via usoclient (USO_EXIT=${exitTok}) [privilege: ${privilege}] — asynchronous; verify with win_update status`, { host: h.name, action, usoclientExit: exitTok, privilege, stdout: res.stdout.trim().slice(0, 200) });
+      if (!m) {
+        return toolError('REMOTE_ERROR', `win_update ${action}: usoclient produced no completion marker, so the trigger is unconfirmed.`, { host: h.name, action, privilege }, 'check win_update status (usoclient=true/false); if usoclient is present, retry, then verify progress with win_update status');
+      }
+      const exitTok = m[1];
+      // Honest framing: usoclient was invoked and returned, but the Update
+      // session it starts is asynchronous and its progress is NOT observable
+      // from here — so this reports invocation, not a verified trigger.
+      return toolText(`win_update ${action}: usoclient invoked on ${h.name} (USO_EXIT=${exitTok}) [privilege: ${privilege}] — the trigger was NOT verified (usoclient is asynchronous); confirm with win_update status`, { host: h.name, action, usoclientExit: exitTok, privilege, invoked: true, verified: false, stdout: res.stdout.trim().slice(0, 200) });
     },
   );
 
@@ -587,6 +616,9 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const h = p.requireHost(sess.host);
       await p.safetyGate(h, 'shell_run', command, override);
       const res = await ssh.runInShell(id, command, timeoutMs);
+      if (res.timedOut) {
+        return toolError('TIMEOUT', `shell_run on ${id} did not complete before the timeout; the session is now desynchronized. Last output:\n${res.output}`, { id, closed: res.closed, timedOut: true }, 'the command may still be running on the host; its output/exit can no longer be attributed, so open a fresh session with shell_open before running more commands');
+      }
       return toolText(res.output, { id, closed: res.closed, output: res.output });
     },
   );
@@ -683,6 +715,223 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     },
   );
 
+  // ------------------------------------------------------- file management --
+  // The read/write family `exec` can only do clumsily, over the same audited
+  // route. Cross-OS by design: Linux uses GNU find (its own glob, via -path) and
+  // grep -E, Windows uses PowerShell (-like, Select-String with a .NET regex).
+  // The dialects genuinely differ, so each description says which one applies
+  // instead of pretending they are interchangeable. Every result is bounded and
+  // every bound it hits is reported.
+
+  p.define(
+    'file_glob',
+    'Find files by name under a directory over SSH, newest-first: GNU find -path on Linux, Get-ChildItem + -like on Windows. The pattern is relative to path on both (Windows matches the full path, so the root is prefixed and "/" is read as "\"). Bounded by maxResults and a capped answer says so. Glob dialect differs by OS: find treats ** as * because -path spans "/", PowerShell -like uses * ? [ ].',
+    {
+      host: z.string().optional(),
+      pattern: z.string().min(1).describe('Glob relative to path, e.g. "*.log" or "src/**/*.ts"'),
+      path: z.string().optional().describe('Directory to search under (default "/" on linux, "C:\\" on windows)'),
+      maxResults: z.number().int().min(1).max(2000).default(200),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, pattern, path, maxResults, timeoutMs }) => {
+      const h = p.requireHost(host);
+      const root = path ?? (h.os === 'windows' ? 'C:\\' : '/');
+      const res = await p.runChecked(h, 'file_glob', buildGlobCommand(h.os, { root, pattern, filesOnly: true, maxResults }), timeoutMs);
+      if (res.code !== 0) {
+        // Honesty about what can be diagnosed: the query ends in 2>/dev/null (it
+        // suppresses the permission-denied noise of a recursive walk), so on Linux
+        // find's own message — including "command not found" — never reaches us and
+        // the exit code is the only evidence. Windows PowerShell writes to stderr,
+        // which is NOT redirected, so its text is usable there.
+        const out = `${res.stderr}\n${res.stdout}`;
+        const missing = /is not recognized|not recognized|: not found|command not found/i.test(out);
+        const gone = h.os === 'linux' && res.code === 127;
+        const why = missing || gone
+          ? ` — no find(1)/powershell on the target${gone ? ' (exit 127)' : ''}`
+          : '';
+        return toolError(
+          'REMOTE_ERROR',
+          `file_glob ${pattern} under ${root} on ${h.name}: ${exitLabel(res)}${why}`,
+          { host: h.name, root, pattern, exitCode: res.code, signal: res.signal, timedOut: res.timedOut, stdout: res.stdout, stderr: res.stderr },
+          missing || gone
+            ? 'install the search tool the target lacks (GNU findutils on Linux, PowerShell on Windows), or run an equivalent command via exec'
+            : h.os === 'linux'
+              ? 'the query suppresses find\'s stderr (2>/dev/null), so re-run the equivalent find via exec without it to read the reason; confirm the root with file_list, and raise timeoutMs for a very large tree'
+              : 'check the root exists with file_list and raise timeoutMs for a very large tree',
+        );
+      }
+      // Parse everything the target sent, then bound the result here so the count
+      // reported is the count actually seen.
+      const all = (h.os === 'windows' ? parseWinGlobOutput : parseFindOutput)(res.stdout, Number.MAX_SAFE_INTEGER);
+      const shown = all.slice(0, maxResults);
+      // Windows caps remotely (Select-Object -First), so filling the cap means
+      // more matches exist that were never sent; on Linux the count is exact
+      // unless the transport's 2 MiB output ceiling truncated it.
+      const capped = h.os === 'windows' ? shown.length >= maxResults : all.length > maxResults;
+      const capNote = !capped ? ''
+        : h.os === 'windows' ? ` (capped at ${maxResults} by the remote query — more matches may exist; narrow the pattern or raise maxResults)`
+        : ` (${all.length} matched, showing the newest ${shown.length}; narrow the pattern or raise maxResults)`;
+      return toolText(
+        `${shown.length} file(s) matching ${pattern} under ${root} on ${h.name}${capNote}${res.truncated ? ' [remote output was truncated at 2 MiB; this list is incomplete]' : ''}` +
+          (shown.length ? '\n' + shown.map((f) => `${new Date(f.mtimeMs).toISOString()} ${f.path}`).join('\n') : ''),
+        { host: h.name, root, pattern, matches: shown.length, totalSeen: all.length, capped, truncatedOutput: res.truncated, files: shown },
+      );
+    },
+  );
+
+  p.define(
+    'file_search',
+    'Search file contents under a directory over SSH and return path:line:text matches. Regex dialect differs by OS and is NOT interchangeable: POSIX ERE via grep -E on Linux, .NET regex via Select-String on Windows. Binary files are skipped; output is capped by maxResults and a capped answer says so.',
+    {
+      host: z.string().optional(),
+      pattern: z.string().min(1).describe('Regex: ERE on Linux (grep -E), .NET on Windows (Select-String)'),
+      path: z.string().optional().describe('Directory to search (default "." = the SSH login cwd; a relative path is fine)'),
+      include: z.string().optional().describe('Restrict file names, e.g. "*.ts" (grep --include on Linux, -like on Windows)'),
+      maxResults: z.number().int().min(1).max(2000).default(200),
+      timeoutMs: z.number().int().min(100).max(120000).default(30000),
+    },
+    async ({ host, pattern, path, include, maxResults, timeoutMs }) => {
+      const h = p.requireHost(host);
+      const root = path ?? '.';
+      const res = await p.runChecked(h, 'file_search', buildSearchCommand(h.os, { root, pattern, include, maxResults }), timeoutMs);
+      // grep exits 1 for "no matches": that is success with zero results. >=2 is a
+      // real remote failure, and a missing exit status (timeout, or no exit-status
+      // payload) is never reported as success.
+      if (res.code === null || res.code >= 2) {
+        // 127 is measurable evidence of a missing search tool even when the shell
+        // says nothing usable; the text forms are the Windows/cmd spellings.
+        const missing = /command not found|: not found|is not recognized|not recognized/i.test(`${res.stderr}\n${res.stdout}`);
+        const gone = h.os === 'linux' && res.code === 127;
+        const need = h.os === 'windows' ? 'powershell' : 'grep';
+        return toolError(
+          'REMOTE_ERROR',
+          `file_search in ${root} on ${h.name}: ${exitLabel(res)}${missing || gone ? ` — no ${need} on the target${gone ? ' (exit 127)' : ''}` : ''}`,
+          { host: h.name, root, pattern, include, exitCode: res.code, signal: res.signal, timedOut: res.timedOut, stdout: res.stdout, stderr: res.stderr },
+          missing || gone
+            ? `install ${need} on the target, or run an equivalent search via exec`
+            : 'check the root exists with file_list; a bad regex can also fail this way (ERE on Linux, .NET on Windows)',
+        );
+      }
+      const all = (h.os === 'windows' ? parseWinSearchOutput : parseGrepOutput)(res.stdout, Number.MAX_SAFE_INTEGER);
+      const shown = all.slice(0, maxResults);
+      const capped = h.os === 'windows' ? shown.length >= maxResults : all.length > maxResults;
+      const capNote = !capped ? ''
+        : h.os === 'windows' ? ` (capped at ${maxResults} by the remote query — more matches may exist; narrow the pattern or raise maxResults)`
+        : ` (${all.length} matched, showing the first ${shown.length}; raise maxResults for the rest)`;
+      // A non-zero exit here is meaningful, not noise: on Linux it is grep's
+      // "no matches" code; on Windows the script only fails if PowerShell did.
+      const exitNote = res.code === 0 ? ''
+        : h.os === 'linux' ? ' [grep exit 1 = no matches]'
+        : ` [powershell exit ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 160) || 'no output'}]`;
+      return toolText(
+        `${shown.length} match(es) for ${pattern} under ${root} on ${h.name}${capNote}${exitNote}${res.truncated ? ' [remote output was truncated at 2 MiB; this list is incomplete]' : ''}` +
+          (shown.length ? '\n' + shown.map((m) => `${m.path}:${m.line}:${m.text}`).join('\n') : ''),
+        { host: h.name, root, pattern, include: include ?? null, matches: shown.length, totalSeen: all.length, capped, truncatedOutput: res.truncated, exitCode: res.code, results: shown },
+      );
+    },
+  );
+
+  p.define(
+    'file_read',
+    'Read a bounded window of a remote text file over SFTP (no shell involved) and return numbered lines under a header stating the window and the real line count. A file larger than maxBytes is read truncated and says so; a file with a NUL byte in the first 8 KiB is refused in favour of file_download.',
+    {
+      host: z.string().optional(),
+      remotePath: z.string().min(1),
+      offset: z.number().int().min(1).default(1).describe('1-based first line to return'),
+      limit: z.number().int().min(1).max(20000).default(2000).describe('Maximum lines to return'),
+      maxBytes: z.number().int().min(1).max(8388608).default(1048576).describe('Stream ceiling; a larger file is read truncated'),
+    },
+    async ({ host, remotePath, offset, limit, maxBytes }) => {
+      const h = p.requireHost(host);
+      const r = await ssh.readRemoteFile(h, h.address, remotePath, { maxBytes });
+      if (looksBinary(r.buffer)) {
+        return toolError(
+          'BAD_ARGS',
+          'file looks binary; use file_download',
+          { host: h.name, remotePath, bytesRead: r.buffer.length },
+          'file_download copies it verbatim — decoding it as text here would return mojibake, so nothing is shown',
+        );
+      }
+      const w = sliceLines(r.buffer.toString('utf8'), offset, limit);
+      const notes: string[] = [];
+      if (r.truncated) notes.push(`(file larger than maxBytes ${maxBytes}B — read truncated, use file_download or raise maxBytes)`);
+      if (w.shown.length === 0) notes.push(`(offset ${offset} is past the end of the file — ${w.totalLinesSeen} line(s) seen)`);
+      const header = `${remotePath} lines ${w.firstLine}-${w.lastLine} of ${w.totalLinesSeen}${notes.length ? ' ' + notes.join(' ') : ''}`;
+      return toolText(
+        `${header}${w.shown.length ? '\n' + w.shown.map((line, i) => `${w.firstLine + i}: ${line}`).join('\n') : ''}${w.truncatedByLimit ? `\n… use offset=${w.lastLine + 1} to continue` : ''}`,
+        { host: h.name, remotePath, offset, firstLine: w.firstLine, lastLine: w.lastLine, totalLinesSeen: w.totalLinesSeen, truncatedByBytes: r.truncated, truncatedByLimit: w.truncatedByLimit, lines: w.shown },
+      );
+    },
+  );
+
+  p.define(
+    'file_write',
+    'Write (or append) text to a remote file over SFTP as UTF-8 and report the byte count. Without append, an existing destination is refused unless overwrite:true and a directory target is refused — the same guard as file_upload. For targeted edits use file_patch.',
+    {
+      host: z.string().optional(),
+      remotePath: z.string().min(1),
+      content: z.string().default('').describe('Text to write as UTF-8; an empty string truncates the file (or appends nothing)'),
+      append: z.boolean().default(false).describe('Append instead of replacing the file'),
+      overwrite: z.boolean().default(false).describe('Replace an existing file when not appending (default false)'),
+    },
+    async ({ host, remotePath, content, append, overwrite }) => {
+      const h = p.requireHost(host);
+      let mode: 'created' | 'replaced' | 'appended' = append ? 'appended' : 'created';
+      if (!append) {
+        const st = await ssh.statRemote(h, h.address, remotePath);
+        if (st?.isDirectory) {
+          throw new ControlError('BAD_ARGS', `target is a directory: ${remotePath} on ${h.name}`, { remotePath, host: h.name }, 'file_write writes files — pass a file path (file_list shows each entry type)');
+        }
+        if (st && overwrite !== true) {
+          throw new ControlError('BAD_ARGS', `Remote destination already exists: ${remotePath} on ${h.name}. Pass overwrite:true to replace it.`, { remotePath, host: h.name, size: st.size, mtime: new Date(st.mtime).toISOString() });
+        }
+        if (st) mode = 'replaced';
+      }
+      const w = await ssh.writeRemoteFile(h, h.address, remotePath, Buffer.from(content, 'utf8'), { append });
+      return toolText(`wrote ${w.bytes} bytes (${mode}) to ${remotePath} on ${h.name}`, { host: h.name, remotePath, bytes: w.bytes, mode });
+    },
+  );
+
+  // A truncated read must never be written back — it would silently truncate the
+  // remote file — so the patch path reads at the family ceiling and refuses above it.
+  const PATCH_MAX_BYTES = 8 * 1024 * 1024;
+
+  p.define(
+    'file_patch',
+    'Apply targeted string edits to a remote text file (read -> patch -> write over SFTP). Each edit\'s oldString must match exactly once unless replaceAll:true; a 0-match or ambiguous match refuses the WHOLE patch, so no edit lands on its own. Binary files and files over 8 MiB are refused rather than rewritten from a truncated read.',
+    {
+      host: z.string().optional(),
+      remotePath: z.string().min(1),
+      edits: z
+        .array(z.object({ oldString: z.string(), newString: z.string(), replaceAll: z.boolean().optional() }).strict())
+        .min(1)
+        .describe('Applied in order against the working text: each edit sees the previous edit\'s result'),
+    },
+    async ({ host, remotePath, edits }) => {
+      const h = p.requireHost(host);
+      const r = await ssh.readRemoteFile(h, h.address, remotePath, { maxBytes: PATCH_MAX_BYTES });
+      if (looksBinary(r.buffer)) {
+        return toolError('BAD_ARGS', 'file looks binary; use file_download, edit locally, then file_upload', { host: h.name, remotePath, bytesRead: r.buffer.length }, 'a string patch on bytes decoded as text can corrupt the file, so nothing was written');
+      }
+      if (r.truncated) {
+        return toolError(
+          'BAD_ARGS',
+          `file is larger than the ${PATCH_MAX_BYTES}B read ceiling, so this read is truncated — writing it back would truncate the remote file`,
+          { host: h.name, remotePath, bytesRead: r.buffer.length },
+          'use file_download + file_upload for a file this large, or run a stream editor on the target via exec',
+        );
+      }
+      // applyPatch validates every edit against a working copy first, so a bad
+      // edit anywhere means nothing is written.
+      const { newText, results } = applyPatch(r.buffer.toString('utf8'), edits);
+      await ssh.writeRemoteFile(h, h.address, remotePath, Buffer.from(newText, 'utf8'), { append: false });
+      return toolText(
+        `patched ${remotePath}: ${results.map((x) => `edit#${x.index} replaced ${x.replaced}`).join('; ')} — read-modify-write, not atomic: concurrent edits can be lost`,
+        { host: h.name, remotePath, results, bytesWritten: newText.length },
+      );
+    },
+  );
+
   // ------------------------------------------------------- local networking --
   p.define(
     'net_ping',
@@ -743,7 +992,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
 
   p.define(
     'cdp_discover',
-    'Listen with a raw-socket CDP listener on a network interface (Get-NetAdapter InterfaceIndex) for Windows CDP neighbor frames up to timeoutMs; an empty result honestly means no neighbors were observed, and a listener that cannot run fails with REMOTE_ERROR.',
+    'Listen with a raw-socket CDP listener on a network interface (Get-NetAdapter InterfaceIndex) for Windows CDP neighbor frames up to timeoutMs; an empty result honestly means no neighbors were observed, and a listener that cannot run fails with CAPABILITY_UNAVAILABLE.',
     {
       interfaceIndex: z.number().int().min(0).max(32),
       timeoutMs: z.number().int().min(1000).max(50000).default(15000),
@@ -751,7 +1000,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
     async ({ interfaceIndex, timeoutMs }) => {
       const neighbors = await p.listenCdpGuarded(interfaceIndex, timeoutMs);
       if (neighbors === null) {
-        return toolError('REMOTE_ERROR', 'the raw-socket CDP listener (powershell) could not start or exited abnormally; raw sockets typically need an elevated control-mcp process.', { interfaceIndex, timeoutMs });
+        return toolError('CAPABILITY_UNAVAILABLE', 'the raw-socket CDP listener (powershell) could not start or exited abnormally on the control machine (this is a local failure, not a target failure); raw sockets typically need an elevated control-mcp process.', { interfaceIndex, timeoutMs }, 'run control-mcp elevated, or skip CDP discovery if raw-socket capture is not available here');
       }
       return toolText(`cdp interface ${interfaceIndex}: ${neighbors.length} neighbor(s)`, { interfaceIndex, timeoutMs, neighbors });
     },
@@ -826,7 +1075,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       if (code === undefined) {
         if (!key) throw new ControlError('BAD_ARGS', 'give key (a VK name like ENTER) or vk (a number)');
         const mapped: number | undefined = VK[key.toUpperCase()];
-        if (mapped === undefined) throw new ControlError('BAD_ARGS', `unknown key name: ${key}. Valid names include A–Z, 0–9, ENTER, ESC, TAB, SPACE, BACKSPACE, DELETE, INSERT, UP/DOWN/LEFT/RIGHT, HOME, END, PAGEUP, PAGEDOWN, F1–F12, and CTRL/ALT/SHIFT/LWIN (used via modifiers). Or pass vk as a number.`, { key }, 'for printable text use rdp_type; rdp_key is for control keys and named hotkeys; vk accepts the raw virtual-key code');
+        if (mapped === undefined) throw new ControlError('BAD_ARGS', `unknown key name: ${key}. Valid names include A–Z, 0–9, ENTER, ESC, TAB, SPACE, BACKSPACE, DELETE, INSERT, UP/DOWN/LEFT/RIGHT, HOME, END, PAGEUP, PAGEDOWN, F1–F12, and CTRL/ALT/SHIFT/WIN (used via modifiers). Or pass vk as a number.`, { key }, 'for printable text use rdp_type; rdp_key is for control keys and named hotkeys; vk accepts the raw virtual-key code');
         code = mapped;
       }
       if (modifiers.length > 0) hotkey(hwnd, modifiers, code);
@@ -936,14 +1185,18 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
           throw new ControlError('BAD_ARGS', `host "${h.name}" is not being watched (watched: ${watched.join(', ') || 'none'}); an empty drain here does not mean "no events", it means this host is not monitored.`, { host: h.name, watched }, 'monitor_start this host first, then drain');
         }
         const one = p.events.drainEvents(h.name);
-        return toolText(one.map(formatEvent).join('\n') || `no new events from ${h.name} since the last drain`, { count: one.length, events: one });
+        const dropped = p.events.getDroppedCount(h.name);
+        const dropNote = dropped > 0 ? `\n(+${dropped} older event(s) dropped by the 500-deep queue cap since this host was watched)` : '';
+        return toolText((one.map(formatEvent).join('\n') || `no new events from ${h.name} since the last drain`) + dropNote, { count: one.length, dropped, events: one });
       }
       const evs = p.events.drainEvents();
       const watched = p.events.listWatched();
       if (watched.length === 0) {
         throw new ControlError('BAD_ARGS', 'no hosts are being watched, so there are no events to drain; run monitor_start first.', { watched: [] }, 'monitor_start <host> begins watching; events arrive via subsequent monitor_events drains');
       }
-      return toolText(evs.map(formatEvent).join('\n') || 'no new events since the last drain', { count: evs.length, events: evs, watched });
+      const dropped = p.events.getDroppedCount();
+      const dropNote = dropped > 0 ? `\n(+${dropped} older event(s) dropped by the 500-deep queue cap across watched hosts)` : '';
+      return toolText((evs.map(formatEvent).join('\n') || 'no new events since the last drain') + dropNote, { count: evs.length, dropped, events: evs, watched });
     },
   );
 
@@ -1335,7 +1588,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const pw = await p.power(h, 'reboot', timeoutMs);
       return toolText(
         `host_reboot ${h.name}: "${pw.command}" issued; ${exitLabel(pw.result)} -- the box will come back up; re-probe with host_status. ${pw.note}`,
-        { host: h.name, command: pw.command, exitCode: pw.result.code, signal: pw.result.signal, stdout: pw.result.stdout, stderr: pw.result.stderr, truncated: pw.result.truncated, durationMs: pw.result.durationMs, note: pw.note },
+        { host: h.name, command: pw.command, exitCode: pw.result.code, signal: pw.result.signal, timedOut: pw.result.timedOut, stdout: pw.result.stdout, stderr: pw.result.stderr, truncated: pw.result.truncated, durationMs: pw.result.durationMs, note: pw.note },
       );
     },
   );
@@ -1350,7 +1603,7 @@ export function registerTools(server: McpServer, cfg: ControlConfig | null, ssh:
       const pw = await p.power(h, 'shutdown', timeoutMs);
       return toolText(
         `host_shutdown ${h.name}: "${pw.command}" issued; ${exitLabel(pw.result)} -- the box powers off; reach it again only by rebooting it on site. ${pw.note}`,
-        { host: h.name, command: pw.command, exitCode: pw.result.code, signal: pw.result.signal, stdout: pw.result.stdout, stderr: pw.result.stderr, truncated: pw.result.truncated, durationMs: pw.result.durationMs, note: pw.note },
+        { host: h.name, command: pw.command, exitCode: pw.result.code, signal: pw.result.signal, timedOut: pw.result.timedOut, stdout: pw.result.stdout, stderr: pw.result.stderr, truncated: pw.result.truncated, durationMs: pw.result.durationMs, note: pw.note },
       );
     },
   );

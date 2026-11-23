@@ -21,19 +21,45 @@ export function psCommand(script: string): string {
 // caller reports raw text rather than inventing a structure.
 export function extractJson(stdout: string): unknown | null {
   const s = stdout.replace(/\r/g, '');
+  // Try each opening bracket and find its MATCHING close by depth (string- and
+  // escape-aware), so a valid payload followed by trailing text still parses —
+  // JSON.parse of "…}\nDONE" fails, and the old whole-tail attempt lost it.
   for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '[' || c === '{') {
-      const candidate = s.slice(i);
-      try {
-        return JSON.parse(candidate);
-      } catch {
-        // Try the next opening brace (a log line may have contained one).
-        continue;
-      }
+    if (s[i] !== '[' && s[i] !== '{') continue;
+    const end = matchBracket(s, i);
+    if (end === -1) continue;
+    try {
+      return JSON.parse(s.slice(i, end + 1));
+    } catch {
+      continue;
     }
   }
   return null;
+}
+
+function matchBracket(s: string, open: number): number {
+  const openCh = s[open];
+  const closeCh = openCh === '[' ? ']' : '}';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = open; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+    } else if (c === openCh) {
+      depth++;
+    } else if (c === closeCh) {
+      if (--depth === 0) return i;
+    }
+  }
+  return -1;
 }
 
 // ---- firewall -------------------------------------------------------------

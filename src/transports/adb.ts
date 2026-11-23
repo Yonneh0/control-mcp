@@ -38,7 +38,7 @@ interface SpawnOut {
 }
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47];
-const INPUT_SAFE = /^[A-Za-z0-9 ._-]+$/;
+const INPUT_SAFE = /^(?!-)[A-Za-z0-9 ._-]+$/; // no leading '-': `input text -h` would be parsed as an option
 // Caps on captured child output; dropping a chunk past a cap sets `truncated`.
 const STDOUT_CAP = 8 * 1024 * 1024;
 const STDERR_CAP = 1 * 1024 * 1024;
@@ -481,7 +481,9 @@ let dumpNonce = 0;
 export async function dumpUi(serial: string, timeoutMs = 20000): Promise<UiNode[]> {
   serial = needSerial(serial);
   const path = `/sdcard/dsh_ui_${process.pid}_${dumpNonce++}.xml`;
-  const r = await adbExec(serial, `rm -f ${path}; uiautomator dump ${path}; cat ${path} 2>/dev/null; rm -f ${path}`, timeoutMs);
+  // Clear this process's stale dumps first: a dump killed on timeout never
+  // reached its trailing `rm`, and the litter would accumulate.
+  const r = await adbExec(serial, `rm -f /sdcard/dsh_ui_${process.pid}_*.xml; rm -f ${path}; uiautomator dump ${path}; cat ${path} 2>/dev/null; rm -f ${path}`, timeoutMs);
   const start = r.stdout.indexOf('<?xml');
   if (start < 0) {
     throw new ControlError(
@@ -526,10 +528,12 @@ const KEY_CODES: Record<string, number> = {
   media_previous: 88,
   media_stop: 86,
   media_rewind: 89,
-  media_fast_forward: 71,
-  brightness_up: 241,
-  brightness_down: 242,
-  lock: 276,
+  media_fast_forward: 90,
+  brightness_up: 221,
+  brightness_down: 220,
+  sleep: 223,
+  wakeup: 224,
+  lock: 276, // KEYCODE_SOFT_SLEEP — the conventional screen-lock key on essentially all devices
 };
 
 export function resolveKeyCode(name: string): number | null {
@@ -591,12 +595,19 @@ function needPackage(pkg: string): string {
 
 export async function currentApp(serial: string, timeoutMs = 15000): Promise<{ focus: string; package: string | null; activity: string | null }> {
   serial = needSerial(serial);
-  const r = await adbExec(serial, `dumpsys window 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp'`, timeoutMs);
-  const line = (r.stdout || '').trim();
-  // mCurrentFocus=Window{7f1a2b3 u0 com.foo.bar/com.foo.bar.MainActivity}
-  const m = /u0\s+([^\s/{}]+)\/([^\s{},]+)/.exec(line);
+  // Grep BOTH keys without -m1: when mCurrentFocus is null (a transition, or no
+  // focused window) -m1 would stop on the null line and lose the real app in
+  // mFocusedApp. We read both and prefer mCurrentFocus, else mFocusedApp.
+  const r = await adbExec(serial, `dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp'`, timeoutMs);
+  const lines = (r.stdout || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const focusLine = lines.find((l) => l.includes('mCurrentFocus')) ?? '';
+  const altLine = lines.find((l) => l.includes('mFocusedApp')) ?? '';
+  // u\d+ (not u0): secondary/headless users run as u10, u11, … and u0-only
+  // silently missed their foreground app.
+  const pick = /u\d+\s+([^\s/{}]+)\/([^\s{},]+)/;
+  const m = pick.exec(focusLine) ?? pick.exec(altLine);
   return {
-    focus: line,
+    focus: focusLine || altLine,
     package: m ? m[1] : null,
     activity: m ? m[2] : null,
   };
@@ -731,7 +742,11 @@ export async function pullFile(serial: string, remotePath: string, localPath: st
     throw new ControlError(res.timedOut ? 'TIMEOUT' : 'REMOTE_ERROR', `pull ${rp} failed: ${res.stderr.trim().slice(0, 200) || 'adb pull exit ' + res.code}`, { serial, remotePath: rp });
   }
   if (!existsSync(localPath)) throw new ControlError('REMOTE_ERROR', `pull reported success but ${localPath} is absent`, { serial, localPath });
-  return { bytes: statSync(localPath).size, localPath };
+  // adb pull of a directory lands a directory; stat of that is meaningless as a
+  // "bytes pulled" figure, so only a regular file counts as success here.
+  const st = statSync(localPath);
+  if (!st.isFile()) throw new ControlError('REMOTE_ERROR', `pull reported success but ${localPath} is not a regular file (a directory pull lands a directory)`, { serial, localPath });
+  return { bytes: st.size, localPath };
 }
 
 export async function pushFile(serial: string, localPath: string, remotePath: string, timeoutMs = 60000): Promise<{ bytes: number }> {
@@ -902,8 +917,12 @@ export async function recordScreen(
   // toybox parser on real devices.
   const shell = `screenrecord --time-limit ${seconds} --bit-rate ${bitRateMbps * 1_000_000} ${remote}`;
   const r = await adbExec(serial, shell, timeoutMs);
-  if (r.code !== 0 && r.code !== null) {
+  if (r.code !== 0) {
     await adbExec(serial, `rm -f ${remote}`, 10000).catch(() => undefined);
+    // A null code means the process was killed (no exit code observed) — the
+    // clip is likely truncated, so it must not be reported as a complete
+    // recording. Only a clean exit 0 is a success.
+    if (r.code === null) throw new ControlError('REMOTE_ERROR', 'screenrecord produced no exit code (process killed or timed out); the clip may be truncated', { serial, seconds });
     throw new ControlError('REMOTE_ERROR', `screenrecord failed: ${(r.stderr || r.stdout).trim().slice(0, 200) || 'exit ' + r.code}`, { serial, seconds });
   }
   const pulled = await pullFile(serial, remote, localPath, timeoutMs);

@@ -55,7 +55,7 @@ const MAX_TRACKED_IDS = 5000;
 const SUMMARY_MAX = 200;
 
 const WIN_PS_QUERY =
-  "Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3} -MaxEvents 20 | ConvertTo-Json -Compress";
+  "Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3} -MaxEvents 20 -ErrorAction SilentlyContinue | ConvertTo-Json -Compress | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) }";
 // cmd.exe is the login shell on Windows hosts: the query is handed over as one
 // base64 UTF-16LE blob so no host-side quoting applies to it.
 const WIN_POLL_COMMAND =
@@ -163,7 +163,10 @@ function tryParseJson(text: string): unknown {
 function decodeWinStdout(stdout: string): string {
   const b64 = stdout.trim().replace(/\s+/g, '');
   if (!b64) return '';
-  let text = Buffer.from(b64, 'base64').toString('utf16le');
+  // The poll now emits base64 of UTF-8 JSON (an explicit side-channel, so the
+  // console text encoding over SSH cannot corrupt it). Decoding raw ConvertTo-Json
+  // output as UTF-16LE yielded zero records forever — caught on a live Windows host.
+  let text = Buffer.from(b64, 'base64').toString('utf8');
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   return text;
 }
