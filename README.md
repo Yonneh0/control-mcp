@@ -60,7 +60,7 @@ Nothing is asserted that was not observed:
 - `host_status` — probes one host over every configured interface: ping on each
   address, SSH handshake, TCP/3389, and (for a declared Windows RDP account) the
   live policy probe. Returns a per-interface verdict plus the RDP verdict with its
-  reason. It also separates **host** reachability (ping/ARP) from **SSH-service** reachability: a refused or filtered port on a host that pings means the box is up and only the daemon is down — it says so and tells you *not* to wake it. An RDP `prerequisites present` verdict means port + policy + credential are in place, not that a session is proven. Run it before any RDP tool, or whenever a box is unclear.
+  reason. It also separates **host** reachability (ping/ARP) from **SSH-service** reachability across an explicit state (`ready`, `auth`, `listening`, `refused`, `filtered`, `down`, `error`): a host that pings but whose port is refused, filtered, `listening` (open and a daemon answered but the handshake hasn't completed) or `auth` (open but the credential rejected) is UP and only the SSH service is down or misconfigured — it says so and tells you *not* to wake it. The probe proves the TCP port opens before negotiating, so a service that is answering is never reported as down, and an unauthenticated port is never reported as ready. An RDP `prerequisites present` verdict means port + policy + credential are in place, not that a session is proven. Run it before any RDP tool, or whenever a box is unclear.
 
 **System metrics** (one SSH exec → a normalized snapshot; sizes are DECIMAL MB/GB; a
 field that can't be measured is `null` + a warning, never a guess)
